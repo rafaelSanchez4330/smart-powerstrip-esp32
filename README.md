@@ -26,7 +26,9 @@ Este repositorio contiene el diseño, código fuente y documentación técnica p
 * **Servidor Web Embebido Autónomo:** No requiere conexión a servicios en la nube externos ni pasarelas adicionales; opera dentro de la red de área local (LAN).
 * **Control Multicanal:** Conmutación independiente de relevadores (4 canales por defecto, escalable a más).
 * **Interfaz Web Asíncrona (SPA):** Tablero de control responsivo con interruptores tipo switch (*toggle sliders*). Utiliza peticiones asíncronas (`fetch API`) para actualizar el estado instantáneamente sin recargar la página.
-* **Modo Punto de Acceso (AP) de Respaldo:** En caso de que la red Wi-Fi no esté disponible o las credenciales fallen, el ESP32 genera su propia red Wi-Fi de rescate (`ESP32-Multicontacto`).
+* **Portal de Configuración Wi-Fi ("Wi-Fi Manager"):** Permite escanear redes Wi-Fi cercanas e ingresar las credenciales desde el navegador web, guardándolas de forma permanente en la memoria Flash (`wifi_config.json`).
+* **Dominio Interno y Servidor DNS Local:** Accesible mediante **`http://smartps.local`** tanto en modo Punto de Acceso (mediante un micro-servidor DNS en el puerto UDP 53) como en la red local (mDNS/DHCP hostname).
+* **Modo Punto de Acceso (AP) Protegido:** Si no hay red configurada o falla la conexión, el ESP32 levanta su propia red Wi-Fi (`SmartPS`, contraseña `SmartPS123`) y solicita la clave de seguridad (`SmartPS`) para modificar la configuración de red.
 * **Inicialización Segura de Pines:** Previene pulsos o encendidos involuntarios durante el arranque del microcontrolador.
 * **Gestión de Recursos en MicroPython:** Manejo de excepciones, timeouts en sockets y recolección forzada de basura (`gc.collect()`) para garantizar estabilidad continua.
 
@@ -128,19 +130,21 @@ Este repositorio contiene el diseño, código fuente y documentación técnica p
 
 ## 💻 Carga y Configuración del Código
 
-El archivo principal [`src/main.py`](file:///c:/Users/rafas/dev/smart-powerstrip-esp32/src/main.py) contiene tanto la lógica de control como el servidor web.
+El proyecto se divide en dos módulos ubicados en la carpeta `src/`:
+* [`src/wifi_manager.py`](file:///c:/Users/rafas/dev/smart-powerstrip-esp32/src/wifi_manager.py): Gestiona la conexión Wi-Fi, el guardado persistente en `wifi_config.json`, el escaneo de redes, el Punto de Acceso (`SmartPS`) y el servidor DNS interno (`http://smartps.local`).
+* [`src/main.py`](file:///c:/Users/rafas/dev/smart-powerstrip-esp32/src/main.py): Controla los relevadores, expone el servidor HTTP y sirve la interfaz web.
 
-### 1. Configurar Credenciales y Pines
-Abre [`src/main.py`](file:///c:/Users/rafas/dev/smart-powerstrip-esp32/src/main.py) y edita la sección inicial de configuración:
+### 1. Verificar Pines y Seguridad (Opcional)
+No es necesario escribir las credenciales de tu red Wi-Fi en el código, ya que puedes configurarlas directamente desde el navegador web al encender el ESP32. Si deseas ajustar pines o las claves por defecto, revisa el inicio de [`src/main.py`](file:///c:/Users/rafas/dev/smart-powerstrip-esp32/src/main.py):
 
 ```python
-# Credenciales de tu red Wi-Fi
-WIFI_SSID = 'Nombre_De_Tu_Red'
-WIFI_PASSWORD = 'Contraseña_De_Tu_Red'
+# Credenciales del Punto de Acceso (AP) del ESP32 y Clave de Seguridad Web
+AP_SSID = 'SmartPS'
+AP_PASSWORD = 'SmartPS123'   # WPA2 exige mínimo 8 caracteres
+ADMIN_PIN = 'SmartPS'        # Clave solicitada en la web para cambiar el Wi-Fi
+HOSTNAME = 'smartps'         # Dominio interno: http://smartps.local
 
 # Lógica del módulo de relés:
-# True: El relé se activa con 0 (GND) y se apaga con 1 (3.3V) -> Comportamiento estándar en módulos con optoacoplador.
-# False: El relé se activa con 1 y se apaga con 0.
 RELAY_ACTIVE_LOW = True
 
 # Mapeo de salidas GPIO
@@ -152,19 +156,20 @@ RELAYS_CONFIG = [
 ]
 ```
 
-### 2. Subir el archivo al ESP32
+### 2. Subir los archivos al ESP32
+
+Debes subir **ambos archivos** (`wifi_manager.py` y `main.py`) a la raíz de la memoria del ESP32:
 
 #### Mediante Thonny IDE:
-1. Abre el archivo [`src/main.py`](file:///c:/Users/rafas/dev/smart-powerstrip-esp32/src/main.py) en Thonny.
-2. Ve a **Archivo** > **Guardar como...** (Save as...).
-3. Selecciona el destino: **Dispositivo MicroPython (MicroPython device)**.
-4. Nómbralo obligatoriamente como **`main.py`** en la raíz del ESP32.
-   > **¿Por qué `main.py`?** MicroPython ejecuta automáticamente `boot.py` (si existe) y luego `main.py` cada vez que el microcontrolador se enciende o se reinicia.
-5. Presiona el botón de reinicio del ESP32 o el botón rojo "Detener/Reiniciar" en Thonny.
+1. Abre [`src/wifi_manager.py`](file:///c:/Users/rafas/dev/smart-powerstrip-esp32/src/wifi_manager.py) en Thonny, ve a **Archivo > Guardar como... > Dispositivo MicroPython** y guárdalo en la raíz como **`wifi_manager.py`**.
+2. Abre [`src/main.py`](file:///c:/Users/rafas/dev/smart-powerstrip-esp32/src/main.py) en Thonny, ve a **Archivo > Guardar como... > Dispositivo MicroPython** y guárdalo en la raíz como **`main.py`**.
+   > **¿Por qué `main.py`?** MicroPython ejecuta automáticamente `main.py` cada vez que el microcontrolador recibe energía o se reinicia.
+3. Presiona el botón de reinicio (`EN / RST`) del ESP32.
 
 #### Mediante línea de comandos (mpremote):
 ```bash
 pip install mpremote
+mpremote connect COM3 cp src/wifi_manager.py :wifi_manager.py
 mpremote connect COM3 cp src/main.py :main.py
 mpremote connect COM3 reset
 ```
@@ -214,34 +219,29 @@ Tierra Física (Cable Verde) ───────────( Clema WAGO comú
 
 ---
 
-## 🌐 Instrucciones de Uso de la Interfaz Web
+## 🌐 Instrucciones de Uso y Configuración Wi-Fi
 
-1. **Obtener la dirección IP:**
-   Al encender el ESP32, observa la salida en la consola serial de Thonny:
-   ```text
-   Intentando conectar a Wi-Fi 'MiHogar_2.4G'......
-   =============================================
-    Wi-Fi Conectado con éxito!
-    Dirección IP asignada: http://192.168.1.85
-   =============================================
-   Servidor web iniciado y esperando peticiones en el puerto 80...
-   ```
+1. **Primer Encendido (Modo Punto de Acceso `SmartPS`):**
+   Cuando el ESP32 se enciende por primera vez (o cuando no encuentra la red Wi-Fi guardada):
+   * Levanta su propia red Wi-Fi llamada **`SmartPS`**.
+   * Conéctate desde tu celular o PC usando la contraseña: **`SmartPS123`**.
+   * Abre tu navegador e ingresa al dominio interno:
+     ```
+     http://smartps.local
+     ```
+     *(o directamente a la IP `http://192.168.4.1`).*
 
-2. **Acceder desde un navegador:**
-   Desde un teléfono móvil o computadora conectada a la misma red Wi-Fi, abre el navegador e ingresa la dirección:
-   ```
-   http://192.168.1.85
-   ```
+2. **Configurar el Wi-Fi de tu Casa / Escuela desde la Web:**
+   * Dentro de la página web, pulsa el botón **"⚙️ Configurar Red Wi-Fi"**.
+   * El ESP32 escaneará automáticamente las redes 2.4 GHz cercanas; elige la tuya de la lista.
+   * Escribe la contraseña de tu Wi-Fi y la **Clave de Seguridad del Dispositivo** (**`SmartPS`**).
+   * Pulsa **"Guardar y Conectar"**. El ESP32 guardará los datos en `wifi_config.json`, se conectará a tu red y te mostrará en pantalla la nueva dirección IP asignada (además de `http://smartps.local`).
+   * A partir de ese momento, aunque desconectes el multicontacto de la corriente, al volver a enchufarlo se conectará automáticamente a tu Wi-Fi.
 
-3. **Operación del Tablero:**
-   * **Interruptor individual:** Desliza el switch de cualquier contacto para encender o apagar la corriente. El badge cambiará inmediatamente a **ENCENDIDO** (verde) o **APAGADO** (gris).
+3. **Operación del Tablero de Relevadores:**
+   * **Interruptor individual:** Desliza el switch de cualquier contacto para encender o apagar la corriente. El indicador cambiará instantáneamente a **ENCENDIDO** (verde) o **APAGADO** (gris).
    * **Botones maestros:** Permiten conmutar todos los contactos al mismo tiempo ("Encender Todos" / "Apagar Todos").
-
-4. **¿Qué hacer si no hay red Wi-Fi disponible? (Modo AP)**
-   Si el ESP32 no encuentra la red configurada en 10 segundos:
-   * Emitirá una red propia llamada **`ESP32-Multicontacto`**.
-   * Conéctate a ella con la contraseña: **`multicontacto123`**.
-   * Abre tu navegador e ingresa a: **`http://192.168.4.1`**.
+   * **Olvidar Red:** Si cambias de lugar o de módem, puedes borrar la red guardada desde el panel **"⚙️ Configurar Red Wi-Fi"** ingresando la clave `SmartPS`, o simplemente encenderlo donde no esté la red anterior y conectarte de nuevo a la red `SmartPS`.
 
 ---
 
