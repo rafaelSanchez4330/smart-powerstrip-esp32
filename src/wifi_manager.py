@@ -350,16 +350,45 @@ class WiFiManager:
             }
 
     def get_status(self):
-        """Devuelve un diccionario con el estado actual de la conexión Wi-Fi y AP."""
+        """Devuelve un diccionario con toda la información de red actual del ESP32."""
         sta_connected = self.sta.isconnected()
-        sta_ip = self.sta.ifconfig()[0] if sta_connected else ""
+        sta_ip = ""
+        sta_netmask = ""
+        sta_gateway = ""
+        sta_dns = ""
         sta_ssid = ""
+        sta_rssi = None
+        sta_channel = None
+        mac_str = ""
+
+        try:
+            mac_bytes = self.sta.config("mac")
+            mac_str = ":".join(f"{b:02X}" for b in mac_bytes)
+        except Exception:
+            pass
+
         if sta_connected:
+            try:
+                ifc = self.sta.ifconfig()
+                sta_ip = ifc[0]
+                sta_netmask = ifc[1]
+                sta_gateway = ifc[2]
+                sta_dns = ifc[3]
+            except Exception:
+                pass
             try:
                 sta_ssid = self.sta.config("essid")
             except Exception:
                 cfg = self.load_config()
                 sta_ssid = cfg["ssid"] if cfg else "Conectado"
+            try:
+                sta_rssi = self.sta.status("rssi")
+            except Exception:
+                pass
+            try:
+                sta_channel = self.sta.config("channel")
+            except Exception:
+                pass
 
         ap_active = self.ap.active()
         ap_ip = self.ap.ifconfig()[0] if ap_active else ""
@@ -368,6 +397,12 @@ class WiFiManager:
             "sta_connected": sta_connected,
             "sta_ssid": sta_ssid,
             "sta_ip": sta_ip,
+            "sta_netmask": sta_netmask,
+            "sta_gateway": sta_gateway,
+            "sta_dns": sta_dns,
+            "sta_rssi": sta_rssi,
+            "sta_channel": sta_channel,
+            "mac": mac_str,
             "ap_active": ap_active,
             "ap_ssid": self.ap_ssid if ap_active else "",
             "ap_ip": ap_ip,
