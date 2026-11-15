@@ -5,31 +5,31 @@ Este repositorio contiene el diseño, código fuente y documentación técnica p
 
 ---
 
-## 📋 Tabla de Contenidos
+## Tabla de Contenidos
 
-1. [Características Principales](#-características-principales)
-2. [Arquitectura del Sistema](#-arquitectura-del-sistema)
-3. [Guía Paso a Paso: Cómo Flashear y Cargar el Código desde PowerShell](#-guía-paso-a-paso-cómo-flashear-y-cargar-el-código-desde-powershell)
-4. [Conexión Física de Componentes (Pinout y Potencia)](#-conexión-física-de-componentes-pinout-y-potencia)
-5. [Cómo Encender el Sistema y Conmutar los Contactos](#-cómo-encender-el-sistema-y-conmutar-los-contactos)
-6. [Guía de Configuración: Primera Vez vs. Uso Diario](#-guía-de-configuración-primera-vez-vs-uso-diario)
-7. [Medidas de Seguridad Eléctrica](#-medidas-de-seguridad-eléctrica)
-8. [Lista de Materiales (BOM)](#-lista-de-materiales-bom)
+1. [Características Principales](#características-principales)
+2. [Arquitectura del Sistema](#arquitectura-del-sistema)
+3. [Guía Paso a Paso: Cómo Flashear y Cargar el Código desde PowerShell](#guía-paso-a-paso-cómo-flashear-y-cargar-el-código-desde-powershell)
+4. [Conexión Física de Componentes (Pinout y Potencia)](#conexión-física-de-componentes-pinout-y-potencia)
+5. [Cómo Encender el Sistema y Conmutar los Contactos](#cómo-encender-el-sistema-y-conmutar-los-contactos)
+6. [Guía de Configuración: Primera Vez vs. Uso Diario](#guía-de-configuración-primera-vez-vs-uso-diario)
+7. [Medidas de Seguridad Eléctrica](#medidas-de-seguridad-eléctrica)
+8. [Lista de Materiales (BOM)](#lista-de-materiales-bom)
 
 ---
 
-## 🚀 Características Principales
+## Características Principales
 
 * **Servidor Web Embebido Autónomo:** Opera directamente dentro de la red local sin depender de servicios en la nube externos.
-* **Control Multicanal:** Conmutación independiente o grupal de 4 relevadores (GPIO `15`, `16`, `17` y `18`).
+* **Control Multicanal y Nombres Personalizables:** Conmutación independiente o grupal de 4 relevadores (GPIO `15`, `16`, `17` y `18`) con nombres editables desde la web y guardados en memoria (`relays_names.json`).
 * **Portal de Configuración Wi-Fi ("Wi-Fi Manager"):** Escanea redes Wi-Fi 2.4 GHz cercanas y permite guardar las credenciales desde el navegador en un archivo permanente (`wifi_config.json`) en la memoria Flash.
 * **Dominio Interno (`http://smartps.local`):** Incluye un micro-servidor DNS en el puerto UDP `53` para el modo Punto de Acceso y registro de hostname DHCP/mDNS para la red local.
-* **Modo Punto de Acceso (AP) Protegido:** Cuando no hay red configurada o no está disponible, levanta su propia red Wi-Fi **`SmartPS`** (contraseña **`SmartPS123`**) y solicita la clave de seguridad **`SmartPS`** en la web para autorizar cambios de red.
+* **Modo Punto de Acceso (AP) Protegido:** Cuando no hay red configurada o no está disponible, levanta su propia red Wi-Fi **`SmartPS`** (contraseña **`SmartPS123`**), muestra una pantalla de inicio dedicada y solicita la clave de seguridad **`SmartPS`** en la web para autorizar cambios de red.
 * **Inicialización Segura de Pines:** Garantiza que todos los relevadores inicien apagados al energizar la placa, evitando chispazos o encendidos involuntarios.
 
 ---
 
-## 🏛 Arquitectura del Sistema
+## Arquitectura del Sistema
 
 ```
 [ Celular / PC (Navegador Web: http://smartps.local) ]
@@ -58,7 +58,7 @@ Este repositorio contiene el diseño, código fuente y documentación técnica p
 
 ---
 
-## ⚡ Guía Paso a Paso: Cómo Flashear y Cargar el Código desde PowerShell
+## Guía Paso a Paso: Cómo Flashear y Cargar el Código desde PowerShell
 
 En MicroPython no es necesario compilar el código Python. El proceso consiste en grabar el intérprete de MicroPython (`.bin`) en la memoria Flash una sola vez y luego copiar los archivos [`src/wifi_manager.py`](file:///c:/Users/rafas/dev/smart-powerstrip-esp32/src/wifi_manager.py) y [`src/main.py`](file:///c:/Users/rafas/dev/smart-powerstrip-esp32/src/main.py) a la raíz del microcontrolador.
 
@@ -123,12 +123,12 @@ Para abrir el monitor serial en vivo desde PowerShell:
 ```powershell
 python -m mpremote connect COM8 repl
 ```
-* Una vez dentro, presiona **`Ctrl + C`** y luego **`Ctrl + D`** para reiniciar suavemente y ver en pantalla el estado de la conexión Wi-Fi y la dirección IP.
+* Una vez dentro, presiona **`Ctrl + C`** y luego **`Ctrl + D`** para reiniciar suavemente y ver en pantalla el estado de la conexión Wi-Fi, las conexiones al Punto de Acceso y las peticiones web a `smartps.local`.
 * Para salir del monitor serial sin detener la placa, presiona **`Ctrl + ]`** o **`Ctrl + X`**.
 
 ---
 
-## 🔌 Conexión Física de Componentes (Pinout y Potencia)
+## Conexión Física de Componentes (Pinout y Potencia)
 
 ### 1. Conexiones de Baja Tensión (ESP32 ──► Módulo de 4 Relevadores)
 
@@ -176,7 +176,7 @@ Tierra (Verde)  ─────────( Clema WAGO común )─────�
 
 ---
 
-## 🔋 Cómo Encender el Sistema y Conmutar los Contactos
+## Cómo Encender el Sistema y Conmutar los Contactos
 
 ### 1. ¿Cómo se enciende la placa ESP32 (Arranque Autónomo)?
 Una vez cargados `wifi_manager.py` y `main.py` en la placa, **no necesitas conectar una computadora**:
@@ -188,10 +188,11 @@ Los módulos de relevadores con optoacoplador funcionan con **lógica inversa (`
 * **Para encender un contacto individual:** En la página web, toca el interruptor deslizable (*switch*) de la tarjeta correspondiente. El ESP32 pondrá el pin GPIO en `0V` (LOW), se encenderá el LED indicador de ese canal en el módulo de relevadores, se escuchará un *"clic"* mecánico cerrando el paso entre `COM` y `NO`, y la etiqueta en la web cambiará a **`ENCENDIDO`** (verde).
 * **Para apagar un contacto individual:** Vuelve a tocar su interruptor deslizable. El ESP32 pondrá el pin GPIO en `3.3V` (HIGH), el relevador abrirá el circuito cortando la corriente y la etiqueta cambiará a **`APAGADO`** (gris).
 * **Para encender o apagar todos a la vez:** Pulsa los botones inferiores **"Encender Todos"** o **"Apagar Todos"** en la interfaz web.
+* **Para personalizar el nombre de un contacto:** Pulsa el botón **"Editar"** junto al nombre del contacto, escribe el nuevo nombre y pulsa **"Guardar"**. El nombre quedará almacenado permanentemente en `relays_names.json`.
 
 ---
 
-## 🌐 Guía de Configuración: Primera Vez vs. Uso Diario
+## Guía de Configuración: Primera Vez vs. Uso Diario
 
 ### Escenario A: Configuración por Primera Vez (o cuando no hay Wi-Fi conocido)
 
@@ -203,11 +204,10 @@ Cuando enciendes el multicontacto por primera vez (o lo llevas a un lugar nuevo 
    * **Contraseña del Wi-Fi:** `SmartPS123`
 3. **Abre la interfaz web en tu navegador (`http://smartps.local` o `http://192.168.4.1`):**
    Al estar en Modo Punto de Acceso (sin red Wi-Fi conectada), aparecerá una **Pantalla de Inicio** con dos opciones:
-   * **📶 Conectar a una Red Wi-Fi:** Abre el buscador de redes para vincular el multicontacto a tu módem.
-   * **🔌 Acceder a los Interruptores:** Te lleva directamente al tablero de control para prender/apagar los 4 contactos y personalizar sus nombres (tocando el botón **`✏️`** al lado de cada contacto; los nombres se guardan en `relays_names.json`).
+   * **Conectar a una Red Wi-Fi:** Abre el buscador de redes para vincular el multicontacto a tu módem.
+   * **Acceder a los Interruptores:** Te lleva directamente al tablero de control para prender/apagar los 4 contactos y personalizar sus nombres.
 4. **Vincula el multicontacto al Wi-Fi de tu casa/escuela:**
-   * En la página web, pulsa el botón **"⚙️ Configurar Red Wi-Fi"**.
-   * El panel buscará automáticamente las redes Wi-Fi **2.4 GHz** cercanas. Selecciona tu red de la lista desplegable.
+   * En la pantalla de configuración de red, el panel buscará automáticamente las redes Wi-Fi **2.4 GHz** cercanas. Selecciona tu red de la lista desplegable.
    * Escribe la **contraseña de tu red Wi-Fi**.
    * En el campo **"Clave de Seguridad del Dispositivo"**, escribe: **`SmartPS`**
    * Pulsa **"Guardar y Conectar"**.
@@ -228,12 +228,12 @@ Una vez que guardaste tu red Wi-Fi en el Escenario A:
    * **`http://<IP-ASIGNADA>`** *(por ejemplo, `http://192.168.1.85`)*.
 3. **¿Cómo cambiar de red Wi-Fi o reiniciar la configuración después?**
    Tienes dos formas:
-   * **Desde la página web:** Abre **"⚙️ Configurar Red Wi-Fi"**, ingresa la clave **`SmartPS`** y elige otra red o pulsa el botón rojo **"Olvidar Red"** (esto borra `wifi_config.json` y vuelve a encender la red `SmartPS`).
+   * **Desde la página web:** Abre **"Configurar Red Wi-Fi"**, ingresa la clave **`SmartPS`** y elige otra red o pulsa el botón **"Olvidar Red"** (esto borra `wifi_config.json` y vuelve a encender la red `SmartPS`).
    * **Automáticamente si apagas tu módem o te mudas:** Si al encender el multicontacto no encuentra la red guardada después de 10 segundos, **activa automáticamente la red de rescate `SmartPS`** (`SmartPS123`) para que nunca pierdas el acceso.
 
 ---
 
-## ⚠️ Medidas de Seguridad Eléctrica
+## Medidas de Seguridad Eléctrica
 
 El voltaje de la red eléctrica doméstica (110V - 240V AC) es peligroso si se manipula sin precaución:
 
@@ -245,7 +245,7 @@ El voltaje de la red eléctrica doméstica (110V - 240V AC) es peligroso si se m
 
 ---
 
-## 📦 Lista de Materiales (BOM)
+## Lista de Materiales (BOM)
 
 Para consultar la lista completa y detallada de componentes electrónicos, de potencia, consumibles y herramientas requeridas, visita el documento:
-👉 **[docs/lista_de_materiales.md](file:///c:/Users/rafas/dev/smart-powerstrip-esp32/docs/lista_de_materiales.md)**
+**[docs/lista_de_materiales.md](file:///c:/Users/rafas/dev/smart-powerstrip-esp32/docs/lista_de_materiales.md)**
