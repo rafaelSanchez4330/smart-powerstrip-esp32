@@ -39,13 +39,13 @@ WIFI_PASSWORD = 'TU_CONTRASEÑA'
 RELAY_ACTIVE_LOW = True
 
 # Asignación de pines GPIO y nombres para cada contacto.
-# Pines recomendados en ESP32 para salidas seguras: 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33.
-# Evitar pines strapping (0, 2, 12, 15) o pines solo entrada (34 a 39).
+# En ESP32-S3, los pines 19 y 20 corresponden al puerto USB nativo (D- y D+),
+# por lo que se usan los pines consecutivos seguros 15, 16, 17 y 18.
 RELAYS_CONFIG = [
-    {"id": 0, "name": "Contacto 1 (Lámpara)", "pin": 16},
-    {"id": 1, "name": "Contacto 2 (Cargador)", "pin": 17},
-    {"id": 2, "name": "Contacto 3 (Monitor)", "pin": 18},
-    {"id": 3, "name": "Contacto 4 (Auxiliar)", "pin": 19},
+    {"id": 0, "name": "Contacto 1 (Lámpara)", "pin": 15},
+    {"id": 1, "name": "Contacto 2 (Cargador)", "pin": 16},
+    {"id": 2, "name": "Contacto 3 (Monitor)", "pin": 17},
+    {"id": 3, "name": "Contacto 4 (Auxiliar)", "pin": 18},
 ]
 
 # ==============================================================================
