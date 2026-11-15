@@ -148,13 +148,13 @@ def generar_html():
     if net_status["sta_connected"]:
         status_pill = (
             f'<div class="net-pill net-ok" id="net-pill">'
-            f'📶 Conectado a <b>{html_escape(net_status["sta_ssid"])}</b> ({net_status["sta_ip"]})'
+            f'Conectado a <b>{html_escape(net_status["sta_ssid"])}</b> ({net_status["sta_ip"]})'
             f'</div>'
         )
     else:
         status_pill = (
             f'<div class="net-pill net-ap" id="net-pill">'
-            f'📡 Modo AP Activo: <b>{AP_SSID}</b> (http://{HOSTNAME}.local)'
+            f'Modo AP Activo: <b>{AP_SSID}</b> (http://{HOSTNAME}.local)'
             f'</div>'
         )
 
@@ -175,12 +175,12 @@ def generar_html():
             <div class="card-info">
                 <div class="title-row" id="title-row-{rid}">
                     <h3 id="name-text-{rid}">{safe_name}</h3>
-                    <button class="btn-icon" onclick="openRename({rid})" title="Cambiar nombre">✏️</button>
+                    <button class="btn-icon" onclick="openRename({rid})" title="Cambiar nombre">Editar</button>
                 </div>
                 <div class="rename-row" id="rename-row-{rid}">
                     <input type="text" id="rename-input-{rid}" value="{safe_name}" maxlength="32" placeholder="Nombre del contacto">
-                    <button class="btn-mini btn-mini-ok" onclick="saveRename({rid})">✓</button>
-                    <button class="btn-mini btn-mini-cancel" onclick="closeRename({rid})">✕</button>
+                    <button class="btn-mini btn-mini-ok" onclick="saveRename({rid})">Guardar</button>
+                    <button class="btn-mini btn-mini-cancel" onclick="closeRename({rid})">Cancelar</button>
                 </div>
                 <span class="badge {badge_class}" id="badge-{rid}">{badge_text}</span>
                 <span class="pin-info">GPIO {r['pin_num']}</span>
@@ -256,10 +256,6 @@ def generar_html():
             text-align: center;
             padding: 10px 6px 6px;
         }}
-        .welcome-icon {{
-            font-size: 42px;
-            margin-bottom: 12px;
-        }}
         .welcome-box h2 {{
             font-size: 19px;
             color: var(--text-main);
@@ -328,11 +324,11 @@ def generar_html():
         }}
         .btn-icon {{
             background: rgba(255, 255, 255, 0.06);
-            border: 1px solid rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.12);
             border-radius: 6px;
             color: var(--text-muted);
-            font-size: 12px;
-            padding: 3px 6px;
+            font-size: 11px;
+            padding: 3px 8px;
             cursor: pointer;
             flex-shrink: 0;
         }}
@@ -352,9 +348,9 @@ def generar_html():
         .btn-mini {{
             border: none;
             border-radius: 6px;
-            padding: 6px 10px;
-            font-size: 13px;
-            font-weight: 700;
+            padding: 6px 9px;
+            font-size: 12px;
+            font-weight: 600;
             cursor: pointer;
         }}
         .btn-mini-ok {{ background: #10b981; color: #052e16; }}
@@ -500,12 +496,11 @@ def generar_html():
         <!-- VISTA 1: Pantalla de Inicio cuando está en Modo AP -->
         <div id="view-welcome" class="{welcome_class}">
             <div class="welcome-box">
-                <div class="welcome-icon">📡</div>
                 <h2>Bienvenido a SmartPS</h2>
-                <p>El multicontacto no está conectado a ninguna red Wi-Fi y opera en modo Punto de Acceso. ¿Qué deseas hacer?</p>
+                <p>El multicontacto no está conectado a ninguna red Wi-Fi y opera en modo Punto de Acceso. Selecciona una opción:</p>
                 <div class="welcome-actions">
-                    <button class="btn-hero btn-hero-wifi" onclick="showView('wifi')">📶 Conectar a una Red Wi-Fi</button>
-                    <button class="btn-hero btn-hero-switches" onclick="showView('relays')">🔌 Acceder a los Interruptores</button>
+                    <button class="btn-hero btn-hero-wifi" onclick="showView('wifi')">Conectar a una Red Wi-Fi</button>
+                    <button class="btn-hero btn-hero-switches" onclick="showView('relays')">Acceder a los Interruptores</button>
                 </div>
             </div>
         </div>
@@ -521,13 +516,13 @@ def generar_html():
                 <button class="btn btn-all-off" onclick="setAll(0)">Apagar Todos</button>
             </div>
 
-            <button class="btn btn-wifi-toggle" onclick="showView('wifi')">⚙️ Configurar Red Wi-Fi</button>
+            <button class="btn btn-wifi-toggle" onclick="showView('wifi')">Configurar Red Wi-Fi</button>
         </div>
 
         <!-- VISTA 3: Configuración de Red Wi-Fi -->
         <div id="view-wifi" class="view">
             <div class="wifi-box">
-                <h4>📶 Configurar Red Wi-Fi (2.4 GHz)</h4>
+                <h4>Configurar Red Wi-Fi (2.4 GHz)</h4>
 
                 <div class="form-group">
                     <label>1. Selecciona tu red Wi-Fi:</label>
@@ -535,7 +530,7 @@ def generar_html():
                         <select id="ssid-select" onchange="onSelectNetwork()">
                             <option value="">-- Presiona Buscar redes --</option>
                         </select>
-                        <button class="btn-sm" onclick="scanNetworks()" id="btn-scan">🔍 Buscar</button>
+                        <button class="btn-sm" onclick="scanNetworks()" id="btn-scan">Buscar</button>
                     </div>
                 </div>
 
@@ -561,7 +556,7 @@ def generar_html():
 
                 <div id="wifi-msg" class="msg-box"></div>
 
-                <button class="btn btn-back" onclick="showView('relays')">🔌 Ir a los Interruptores</button>
+                <button class="btn btn-back" onclick="showView('relays')">Ir a los Interruptores</button>
             </div>
         </div>
 
@@ -657,7 +652,7 @@ def generar_html():
             const btn = document.getElementById('btn-scan');
             const sel = document.getElementById('ssid-select');
             btn.disabled = true;
-            btn.textContent = '⏳...';
+            btn.textContent = 'Buscando...';
             showMsg('Escaneando redes Wi-Fi cercanas...', 'msg-info');
 
             fetch('/wifi/scan')
@@ -679,7 +674,7 @@ def generar_html():
                 .catch(() => showMsg('Error al escanear redes.', 'msg-err'))
                 .finally(() => {{
                     btn.disabled = false;
-                    btn.textContent = '🔍 Buscar';
+                    btn.textContent = 'Buscar';
                 }});
         }}
 
@@ -712,7 +707,7 @@ def generar_html():
                 .then(res => {{
                     if (res.ok) {{
                         showMsg(
-                            '✅ <b>¡Conectado con éxito a ' + res.ssid + '!</b><br>' +
+                            '<b>Conectado con éxito a ' + res.ssid + '</b><br>' +
                             'Nueva IP asignada: <a href="http://' + res.ip + '">http://' + res.ip + '</a><br>' +
                             'Dominio en tu red: <a href="http://' + res.hostname + '">http://' + res.hostname + '</a>',
                             'msg-ok'
@@ -720,10 +715,10 @@ def generar_html():
                         const pill = document.getElementById('net-pill');
                         if (pill) {{
                             pill.className = 'net-pill net-ok';
-                            pill.innerHTML = '📶 Conectado a <b>' + res.ssid + '</b> (' + res.ip + ')';
+                            pill.innerHTML = 'Conectado a <b>' + res.ssid + '</b> (' + res.ip + ')';
                         }}
                     }} else {{
-                        showMsg('❌ ' + res.error, 'msg-err');
+                        showMsg('Error: ' + res.error, 'msg-err');
                     }}
                 }})
                 .catch(() => showMsg('Se envió la configuración. Verifica tu conexión a la red local.', 'msg-info'));
@@ -739,9 +734,9 @@ def generar_html():
                 .then(r => r.json())
                 .then(res => {{
                     if (res.ok) {{
-                        showMsg('🗑️ Red olvidada. Punto de Acceso <b>{AP_SSID}</b> activo en http://{HOSTNAME}.local (192.168.4.1).', 'msg-ok');
+                        showMsg('Red olvidada. Punto de Acceso <b>{AP_SSID}</b> activo en http://{HOSTNAME}.local (192.168.4.1).', 'msg-ok');
                     }} else {{
-                        showMsg('❌ ' + res.error, 'msg-err');
+                        showMsg('Error: ' + res.error, 'msg-err');
                     }}
                 }})
                 .catch(err => console.error(err));
@@ -842,6 +837,14 @@ def iniciar_servidor():
                 continue
                 
             path = parts[1]
+            client_ip = addr[0]
+
+            # Extraer cabecera Host (ej. smartps.local o 192.168.4.1)
+            host_header = ""
+            for line in request.split('\r\n')[1:]:
+                if line.lower().startswith('host:'):
+                    host_header = line.split(':', 1)[1].strip()
+                    break
             
             # 1. Ignorar solicitudes de favicon para ahorrar tiempo y recursos
             if path == '/favicon.ico':
@@ -856,6 +859,7 @@ def iniciar_servidor():
                 val = int(params.get('val', -1))
                 
                 if 0 <= relay_id < len(relays) and val in (0, 1):
+                    print(f"[WEB] Cliente {client_ip} -> Conmutando [{relays[relay_id]['name']}]")
                     set_relay(relay_id, bool(val))
                     send_json(conn, {"id": relay_id, "is_on": relays[relay_id]["is_on"]})
                 else:
@@ -867,6 +871,7 @@ def iniciar_servidor():
             if path.startswith('/set_all?'):
                 params = parse_query_params(path)
                 val = int(params.get('val', 0))
+                print(f"[WEB] Cliente {client_ip} -> {'ENCENDER' if val else 'APAGAR'} TODOS")
                 for r in relays:
                     set_relay(r["id"], bool(val))
                 
@@ -889,6 +894,7 @@ def iniciar_servidor():
 
             # 5. Endpoint Wi-Fi: Escanear redes cercanas (/wifi/scan)
             if path.startswith('/wifi/scan'):
+                print(f"[WEB] Cliente {client_ip} -> Escaneando redes Wi-Fi cercanas...")
                 networks = wifi.scan_networks()
                 send_json(conn, networks)
                 conn.close()
@@ -900,6 +906,7 @@ def iniciar_servidor():
                 ssid = params.get('ssid', '').strip()
                 password = params.get('pass', '')
                 pin = params.get('pin', '').strip()
+                print(f"[WEB] Cliente {client_ip} -> Solicitud de conexión a red '{ssid}'")
                 result = wifi.configure_new_network(ssid, password, pin)
                 send_json(conn, result)
                 conn.close()
@@ -910,8 +917,10 @@ def iniciar_servidor():
                 params = parse_query_params(path)
                 pin = params.get('pin', '').strip()
                 if pin != ADMIN_PIN:
+                    print(f"[WEB] Cliente {client_ip} -> Intento fallido de olvidar red (Clave incorrecta)")
                     send_json(conn, {"ok": False, "error": "Clave de seguridad incorrecta."})
                 else:
+                    print(f"[WEB] Cliente {client_ip} -> Olvidando red Wi-Fi guardada")
                     wifi.clear_config()
                     send_json(conn, {"ok": True})
                 conn.close()
@@ -924,6 +933,7 @@ def iniciar_servidor():
                 continue
 
             # 9. Ruta Principal (y detección de Portal Cautivo): Retornar interfaz HTML
+            print(f"[WEB] Acceso a página principal desde {client_ip} (Host: {host_header or 'directo'} | Ruta: {path})")
             html_content = generar_html()
             html_bytes = html_content.encode('utf-8')
             response_headers = (

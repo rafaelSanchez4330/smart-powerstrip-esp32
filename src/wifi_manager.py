@@ -53,6 +53,22 @@ class DNSServer:
             self.sock = None
             print("[DNS] Servidor DNS detenido.")
 
+    def _extract_domain(self, data):
+        """Extrae el nombre de dominio consultado en el paquete DNS."""
+        try:
+            idx = 12
+            labels = []
+            while idx < len(data):
+                length = data[idx]
+                if length == 0:
+                    break
+                idx += 1
+                labels.append(data[idx : idx + length].decode("utf-8", "ignore"))
+                idx += length
+            return ".".join(labels)
+        except Exception:
+            return ""
+
     def process_next(self):
         """Procesa una consulta DNS pendiente sin bloquear el ciclo principal."""
         if self.sock is None:
@@ -61,6 +77,10 @@ class DNSServer:
             data, addr = self.sock.recvfrom(512)
             if len(data) < 12:
                 return
+
+            domain = self._extract_domain(data)
+            if "smartps" in domain.lower():
+                print(f"[DNS] Resolviendo '{domain}' para cliente {addr[0]} -> {self.ip}")
 
             # Construir respuesta DNS estándar apuntando a self.ip
             # Header DNS: Transaction ID (2B) + Flags 0x8180 (Standard query response, No error)
@@ -104,6 +124,8 @@ class WiFiManager:
         self.ap = network.WLAN(network.AP_IF)
         self.dns_server = None
         self.ap_shutdown_deadline = None
+        self._known_stations = set()
+        self._last_station_check = 0
 
     # --------------------------------------------------------------------------
     # Almacenamiento Persistente (wifi_config.json)
@@ -352,16 +374,48 @@ class WiFiManager:
             "hostname": f"{self.hostname}.local",
         }
 
+    def _check_ap_stations(self):
+        """Detecta y muestra en consola cuando un dispositivo se conecta o desconecta del AP."""
+        if not self.ap.active():
+            return
+        try:
+            stations = self.ap.status("stations")
+            current_macs = set()
+            for st in stations:
+                mac_bytes = st[0] if isinstance(st, tuple) else st
+                mac_str = ":".join(f"{b:02x}" for b in mac_bytes)
+                current_macs.add(mac_str)
+
+            for mac in current_macs - self._known_stations:
+                print(
+                    f"[AP] Nuevo dispositivo conectado a '{self.ap_ssid}' "
+                    f"(MAC: {mac}) | Dispositivos activos: {len(current_macs)}"
+                )
+            for mac in self._known_stations - current_macs:
+                print(
+                    f"[AP] Dispositivo desconectado de '{self.ap_ssid}' "
+                    f"(MAC: {mac}) | Dispositivos activos: {len(current_macs)}"
+                )
+            self._known_stations = current_macs
+        except Exception:
+            pass
+
     def tick(self):
         """
         Se llama periódicamente desde el bucle del servidor:
         - Atiende consultas del servidor DNS si el AP está activo.
+        - Monitorea dispositivos conectados al AP cada ~1 segundo.
         - Apaga el AP de forma diferida tras haber configurado exitosamente una red STA.
         """
         if self.dns_server is not None and self.dns_server.sock is not None:
             self.dns_server.process_next()
 
-        if self.ap_shutdown_deadline is not None and time.time() >= self.ap_shutdown_deadline:
+        now = time.time()
+        if now != self._last_station_check:
+            self._last_station_check = now
+            self._check_ap_stations()
+
+        if self.ap_shutdown_deadline is not None and now >= self.ap_shutdown_deadline:
             if self.sta.isconnected():
                 self.stop_ap()
             else:
