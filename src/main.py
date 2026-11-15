@@ -1,11 +1,11 @@
 """
 Multicontacto Inteligente con ESP32 y MicroPython
-Proyecto Académico - Servidor Web Embebido, Gestor Wi-Fi y Control de Relevadores
+Proyecto Académico - Servidor Web Embebido, Gestor Wi-Fi, Dashboard de Uso y Control de Relevadores
 
-Este programa utiliza 'wifi_manager.py' para conectarse a una red Wi-Fi guardada
-en memoria Flash ('wifi_config.json') o levantar un Punto de Acceso seguro ('SmartPS')
-con servidor DNS interno (http://smartps.local) para configurar las credenciales
-desde cualquier navegador web y conmutar los contactos eléctricos.
+Rutas de páginas HTML servidas por el ESP32:
+- GET /              -> Pantalla de Inicio con Dashboard de Tiempo de Uso (Hoy y Promedio Semanal)
+- GET /interruptores -> Pantalla de Control de Relevadores y edición de nombres
+- GET /red           -> Pantalla de Información de Red Actual y Cambio de Red Wi-Fi
 """
 
 import json
@@ -30,15 +30,14 @@ HOSTNAME = 'smartps'         # Dominio interno: http://smartps.local
 WIFI_SSID = 'TU_RED_WIFI'
 WIFI_PASSWORD = 'TU_CONTRASEÑA'
 
-# Archivo donde se guardan los nombres personalizados de cada contacto
+# Archivos de persistencia en memoria Flash
 NAMES_FILE = 'relays_names.json'
+STATS_FILE = 'usage_stats.json'
 
-# NOTA DE SEGURIDAD SOBRE RELEVADORES:
-# La gran mayoría de los módulos de relevadores de 5V para Arduino/ESP32 son
-# ACTIVOS EN BAJO (Active LOW), lo que significa:
-#   - 0 lógico (0V) -> Relevador ACTIVO (Contacto CERRADO / Conduce corriente)
-#   - 1 lógico (3.3V) -> Relevador INACTIVO (Contacto ABIERTO / Corta corriente)
-# Si tu módulo es Activo en Alto (Active HIGH), cambia esta variable a False.
+# Zona horaria para corte de día (UTC-6 México)
+TZ_OFFSET_SEC = -6 * 3600
+
+# Lógica del módulo de relevadores (True = Activo en Bajo 0V, False = Activo en Alto 3.3V)
 RELAY_ACTIVE_LOW = True
 
 # Asignación de pines GPIO y nombres por defecto para cada contacto.
@@ -52,11 +51,31 @@ RELAYS_CONFIG = [
 ]
 
 # ==============================================================================
-# 2. INICIALIZACIÓN DE HARDWARE Y NOMBRES PERSONALIZADOS
+# 2. RELOJ, INICIALIZACIÓN DE HARDWARE Y ESTADÍSTICAS DE USO
 # ==============================================================================
 
+ntp_synced = False
+
+def sync_ntp_time():
+    """Intenta sincronizar la hora real por NTP cuando hay conexión Wi-Fi."""
+    global ntp_synced
+    if ntp_synced:
+        return
+    try:
+        import ntptime
+        ntptime.timeout = 2
+        ntptime.settime()
+        ntp_synced = True
+        print("[Reloj] Hora sincronizada mediante NTP.")
+    except Exception:
+        pass
+
+def get_current_day_key() -> str:
+    """Devuelve identificador de fecha 'YYYY-MM-DD' para agrupar estadísticas por día."""
+    t = time.localtime(time.time() + TZ_OFFSET_SEC)
+    return f"{t[0]:04d}-{t[1]:02d}-{t[2]:02d}"
+
 def load_custom_names() -> dict:
-    """Carga los nombres personalizados de los contactos desde la memoria Flash."""
     try:
         with open(NAMES_FILE, "r") as f:
             data = json.load(f)
@@ -67,7 +86,6 @@ def load_custom_names() -> dict:
     return {}
 
 def save_custom_names():
-    """Guarda los nombres actuales de los contactos en la memoria Flash."""
     try:
         data = {str(r["id"]): r["name"] for r in relays}
         with open(NAMES_FILE, "w") as f:
@@ -76,7 +94,6 @@ def save_custom_names():
         print(f"Error al guardar nombres: {e}")
 
 def get_physical_value(is_on: bool) -> int:
-    """Convierte el estado lógico deseado (True=Encendido, False=Apagado) al nivel físico del pin."""
     if RELAY_ACTIVE_LOW:
         return 0 if is_on else 1
     else:
@@ -86,7 +103,6 @@ saved_names = load_custom_names()
 relays = []
 for config in RELAYS_CONFIG:
     pin_obj = Pin(config["pin"], Pin.OUT)
-    # Por seguridad, asegurar que todos los relevadores inicien APAGADOS (circuito abierto)
     pin_obj.value(get_physical_value(False))
     custom_name = saved_names.get(str(config["id"]), config["name"])
     
@@ -95,15 +111,126 @@ for config in RELAYS_CONFIG:
         "name": custom_name,
         "pin_num": config["pin"],
         "pin_obj": pin_obj,
-        "is_on": False
+        "is_on": False,
+        "on_since": None,
     })
 
+def _empty_day_dict() -> dict:
+    return {str(r["id"]): 0 for r in relays}
+
+def load_usage_stats() -> dict:
+    """Carga las estadísticas de tiempo de uso diario e historial semanal."""
+    day_key = get_current_day_key()
+    default_stats = {
+        "current_day": day_key,
+        "today_sec": _empty_day_dict(),
+        "today_toggles": _empty_day_dict(),
+        "history": [],  # Lista de hasta 6 días previos: [{"day": "YYYY-MM-DD", "sec": {"0": 120, ...}}]
+    }
+    try:
+        with open(STATS_FILE, "r") as f:
+            data = json.load(f)
+            if isinstance(data, dict) and "today_sec" in data:
+                for r in relays:
+                    k = str(r["id"])
+                    data["today_sec"].setdefault(k, 0)
+                    data.setdefault("today_toggles", {}).setdefault(k, 0)
+                data.setdefault("history", [])
+                data.setdefault("current_day", day_key)
+                return data
+    except Exception:
+        pass
+    return default_stats
+
+usage_stats = load_usage_stats()
+
+def save_usage_stats():
+    try:
+        with open(STATS_FILE, "w") as f:
+            json.dump(usage_stats, f)
+    except Exception as e:
+        print(f"Error al guardar estadísticas: {e}")
+
+def update_active_timers(save_to_disk: bool = False):
+    """
+    Acumula los segundos transcurridos de los relevadores que están actualmente ENCENDIDOS
+    y verifica si hubo cambio de día para rotar el historial de los últimos 7 días.
+    """
+    now = time.time()
+    day_key = get_current_day_key()
+
+    # Si cambió el día, guardar el día concluido en el historial (máximo 6 días previos + hoy = 7 días)
+    if usage_stats.get("current_day") != day_key:
+        for r in relays:
+            if r["is_on"] and r["on_since"] is not None:
+                elapsed = max(0, int(now - r["on_since"]))
+                k = str(r["id"])
+                usage_stats["today_sec"][k] = usage_stats["today_sec"].get(k, 0) + elapsed
+                r["on_since"] = now
+
+        prev_day = usage_stats.get("current_day", day_key)
+        usage_stats["history"].append({
+            "day": prev_day,
+            "sec": dict(usage_stats["today_sec"]),
+        })
+        if len(usage_stats["history"]) > 6:
+            usage_stats["history"] = usage_stats["history"][-6:]
+
+        usage_stats["current_day"] = day_key
+        usage_stats["today_sec"] = _empty_day_dict()
+        usage_stats["today_toggles"] = _empty_day_dict()
+        save_to_disk = True
+
+    # Acumular tiempo de los contactos actualmente encendidos
+    for r in relays:
+        if r["is_on"] and r["on_since"] is not None:
+            elapsed = max(0, int(now - r["on_since"]))
+            if elapsed > 0:
+                k = str(r["id"])
+                usage_stats["today_sec"][k] = usage_stats["today_sec"].get(k, 0) + elapsed
+                r["on_since"] = now
+
+    if save_to_disk:
+        save_usage_stats()
+
+def reset_usage_stats():
+    """Reinicia a cero las estadísticas del día y el historial semanal."""
+    now = time.time()
+    usage_stats["current_day"] = get_current_day_key()
+    usage_stats["today_sec"] = _empty_day_dict()
+    usage_stats["today_toggles"] = _empty_day_dict()
+    usage_stats["history"] = []
+    for r in relays:
+        if r["is_on"]:
+            r["on_since"] = now
+        else:
+            r["on_since"] = None
+    save_usage_stats()
+    print("[Stats] Estadísticas de tiempo de uso reiniciadas.")
+
 def set_relay(relay_id: int, state: bool):
-    """Enciende (True) o apaga (False) el relevador indicado por su id."""
+    """Enciende (True) o apaga (False) el relevador indicado y registra su tiempo de uso."""
     if 0 <= relay_id < len(relays):
-        relays[relay_id]["is_on"] = state
-        relays[relay_id]["pin_obj"].value(get_physical_value(state))
-        print(f"[{relays[relay_id]['name']}] -> {'ENCENDIDO' if state else 'APAGADO'}")
+        r = relays[relay_id]
+        was_on = r["is_on"]
+        now = time.time()
+        k = str(relay_id)
+
+        update_active_timers(save_to_disk=False)
+
+        if state and not was_on:
+            r["on_since"] = now
+            usage_stats["today_toggles"][k] = usage_stats["today_toggles"].get(k, 0) + 1
+        elif not state and was_on:
+            if r["on_since"] is not None:
+                elapsed = max(0, int(now - r["on_since"]))
+                usage_stats["today_sec"][k] = usage_stats["today_sec"].get(k, 0) + elapsed
+            r["on_since"] = None
+
+        r["is_on"] = state
+        r["pin_obj"].value(get_physical_value(state))
+        save_usage_stats()
+        print(f"[{r['name']}] -> {'ENCENDIDO' if state else 'APAGADO'}")
 
 def rename_relay(relay_id: int, new_name: str) -> bool:
     """Cambia y guarda el nombre personalizado de un contacto."""
@@ -114,6 +241,45 @@ def rename_relay(relay_id: int, new_name: str) -> bool:
         print(f"[Contacto {relay_id + 1}] renombrado a: '{relays[relay_id]['name']}'")
         return True
     return False
+
+def get_relays_state_with_stats() -> list:
+    """Devuelve la lista de contactos con su estado, tiempo de hoy y promedio semanal."""
+    update_active_timers(save_to_disk=False)
+    history = usage_stats.get("history", [])
+    days_count = len(history) + 1  # Días registrados en la ventana de hasta 7 días (mínimo 1: hoy)
+
+    items = []
+    for r in relays:
+        k = str(r["id"])
+        today_s = int(usage_stats["today_sec"].get(k, 0))
+        hist_s = sum(int(day_entry.get("sec", {}).get(k, 0)) for day_entry in history)
+        week_total_s = hist_s + today_s
+        week_avg_s = int(round(week_total_s / days_count))
+        toggles = int(usage_stats.get("today_toggles", {}).get(k, 0))
+
+        items.append({
+            "id": r["id"],
+            "name": r["name"],
+            "pin": r["pin_num"],
+            "is_on": r["is_on"],
+            "today_sec": today_s,
+            "week_avg_sec": week_avg_s,
+            "week_total_sec": week_total_s,
+            "toggles_today": toggles,
+            "days_recorded": days_count,
+        })
+    return items
+
+def format_duration_py(sec: int) -> str:
+    sec = max(0, int(sec))
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    if h > 0:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m > 0:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
 
 # ==============================================================================
 # 3. GESTIÓN DE RED Y WI-FI MANAGER
@@ -129,7 +295,7 @@ wifi = WiFiManager(
 )
 
 def get_full_net_status() -> dict:
-    """Obtiene el estado de red de forma segura incluso si wifi_manager tiene versión previa."""
+    """Obtiene el estado de red de forma segura."""
     st = wifi.get_status()
     if "sta_netmask" not in st:
         st["sta_netmask"] = ""
@@ -163,7 +329,7 @@ def get_full_net_status() -> dict:
     return st
 
 # ==============================================================================
-# 4. GENERACIÓN DE LA INTERFAZ WEB (HTML + CSS + JavaScript)
+# 4. PLANTILLAS WEB SEPARADAS POR RUTA (/, /interruptores, /red)
 # ==============================================================================
 
 def html_escape(text) -> str:
@@ -175,43 +341,382 @@ def html_escape(text) -> str:
         .replace('"', "&quot;")
     )
 
-def generar_html() -> str:
-    """Genera la interfaz web con pantalla de inicio en modo AP, interruptores editables y gestor Wi-Fi."""
+BASE_CSS = """
+:root {
+  --bg-color: #0f172a;
+  --card-bg: #1e293b;
+  --text-main: #f8fafc;
+  --text-muted: #94a3b8;
+  --switch-bg: #334155;
+  --switch-active: #3b82f6;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background-color: var(--bg-color);
+  color: var(--text-main);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 100vh;
+  padding: 20px;
+}
+.container {
+  width: 100%;
+  max-width: 500px;
+  background: var(--card-bg);
+  border-radius: 20px;
+  padding: 24px 20px;
+  box-shadow: 0 20px 40px rgba(0,0,0,0.4);
+  border: 1px solid rgba(255,255,255,0.08);
+}
+header {
+  text-align: center;
+  margin-bottom: 16px;
+  border-bottom: 1px solid rgba(255,255,255,0.1);
+  padding-bottom: 14px;
+}
+header h1 { font-size: 22px; font-weight: 700; color: #38bdf8; }
+header p { font-size: 13px; color: var(--text-muted); margin-top: 4px; }
+.net-pill {
+  display: inline-block;
+  margin-top: 10px;
+  font-size: 12px;
+  padding: 5px 12px;
+  border-radius: 20px;
+}
+.net-ok { background: rgba(16,185,129,0.14); color: #34d399; border: 1px solid rgba(16,185,129,0.3); }
+.net-ap { background: rgba(245,158,11,0.15); color: #fbbf24; border: 1px solid rgba(245,158,11,0.35); }
+.top-nav {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+.btn-nav-back, .btn-nav-link {
+  display: inline-block;
+  text-decoration: none;
+  background: rgba(255,255,255,0.07);
+  border: 1px solid rgba(255,255,255,0.16);
+  color: var(--text-main);
+  border-radius: 8px;
+  padding: 7px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.btn-nav-link {
+  color: #38bdf8;
+  border-color: rgba(56,189,248,0.3);
+  background: rgba(56,189,248,0.1);
+}
+.btn-nav-back:hover, .btn-nav-link:hover {
+  background: rgba(255,255,255,0.14);
+}
+.info-list {
+  background: rgba(15,23,42,0.55);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 12px;
+  padding: 6px 14px;
+  margin-bottom: 14px;
+}
+.info-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 9px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  font-size: 13px;
+}
+.info-row:last-child { border-bottom: none; }
+.info-label { color: var(--text-muted); font-size: 12px; }
+.info-val { color: var(--text-main); font-weight: 600; text-align: right; }
+.menu-actions { display: flex; gap: 10px; margin-bottom: 18px; }
+.btn-hero {
+  flex: 1;
+  display: block;
+  text-align: center;
+  text-decoration: none;
+  padding: 12px 10px;
+  border-radius: 12px;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  border: none;
+}
+.btn-hero-primary { background: linear-gradient(135deg, #2563eb, #0284c7); color: white; }
+.btn-hero-secondary {
+  background: rgba(255,255,255,0.06);
+  color: var(--text-main);
+  border: 1px solid rgba(255,255,255,0.16);
+}
+.badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 10px;
+  text-transform: uppercase;
+}
+.badge-on { background: rgba(16,185,129,0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.3); }
+.badge-off { background: rgba(100,116,139,0.15); color: #94a3b8; border: 1px solid rgba(100,116,139,0.3); }
+footer { text-align: center; margin-top: 16px; font-size: 11px; color: var(--text-muted); }
+a { color: #38bdf8; }
+"""
+
+def _build_status_pill(net_status: dict) -> str:
+    if net_status.get("sta_connected"):
+        ssid = html_escape(net_status.get("sta_ssid", ""))
+        ip = html_escape(net_status.get("sta_ip", ""))
+        return f'<div class="net-pill net-ok" id="net-pill">Conectado a <b>{ssid}</b> ({ip})</div>'
+    return f'<div class="net-pill net-ap" id="net-pill">Modo AP Activo: <b>{AP_SSID}</b> (http://{HOSTNAME}.local)</div>'
+
+
+# ------------------------------------------------------------------------------
+# PÁGINA 1: PANTALLA DE INICIO CON DASHBOARD DE TIEMPO DE USO (Ruta: GET /)
+# ------------------------------------------------------------------------------
+def generar_html_inicio() -> str:
     net_status = get_full_net_status()
-    sta_ok = bool(net_status.get("sta_connected"))
-    is_ap_only = not sta_ok
+    status_pill = _build_status_pill(net_status)
+    stats_list = get_relays_state_with_stats()
 
-    sta_ssid = html_escape(net_status.get("sta_ssid", ""))
-    sta_ip = html_escape(net_status.get("sta_ip", ""))
-    sta_gw = html_escape(net_status.get("sta_gateway", "-"))
-    sta_mask = html_escape(net_status.get("sta_netmask", "-"))
-    sta_dns = html_escape(net_status.get("sta_dns", "-"))
-    rssi_val = net_status.get("sta_rssi")
-    chan_val = net_status.get("sta_channel")
-    rssi_str = f"{rssi_val} dBm" if rssi_val is not None else "N/D"
-    chan_str = f"Canal {chan_val} (2.4 GHz)" if chan_val is not None else "2.4 GHz"
-    mac_str = html_escape(net_status.get("mac") or "N/D")
+    encendidos = sum(1 for r in stats_list if r["is_on"])
+    total_today_sec = sum(r["today_sec"] for r in stats_list)
+    total_week_avg_sec = sum(r["week_avg_sec"] for r in stats_list)
+    max_sec = max([r["today_sec"] for r in stats_list] + [r["week_avg_sec"] for r in stats_list] + [60])
 
-    if sta_ok:
-        status_pill = (
-            f'<div class="net-pill net-ok" id="net-pill">'
-            f'Conectado a <b>{sta_ssid}</b> ({sta_ip})'
+    dash_cards = ""
+    for r in stats_list:
+        rid = r["id"]
+        safe_name = html_escape(r["name"])
+        badge_class = "badge-on" if r["is_on"] else "badge-off"
+        badge_text = "ENCENDIDO" if r["is_on"] else "APAGADO"
+        pct_today = min(100, int((r["today_sec"] * 100) / max_sec)) if max_sec > 0 else 0
+        pct_week = min(100, int((r["week_avg_sec"] * 100) / max_sec)) if max_sec > 0 else 0
+
+        dash_cards += (
+            f'<div class="stat-card">'
+            f'<div class="stat-head">'
+            f'<span class="stat-name" id="st-name-{rid}">{safe_name}</span>'
+            f'<span class="badge {badge_class}" id="st-badge-{rid}">{badge_text}</span>'
+            f'</div>'
+            f'<div class="bar-group">'
+            f'<div class="bar-label"><span>Tiempo hoy</span><b id="st-today-{rid}">{format_duration_py(r["today_sec"])}</b></div>'
+            f'<div class="bar-track"><div class="bar-fill bar-today" id="st-bar-today-{rid}" style="width:{pct_today}%"></div></div>'
+            f'</div>'
+            f'<div class="bar-group">'
+            f'<div class="bar-label"><span>Promedio diario (semana)</span><b id="st-week-{rid}">{format_duration_py(r["week_avg_sec"])}</b></div>'
+            f'<div class="bar-track"><div class="bar-fill bar-week" id="st-bar-week-{rid}" style="width:{pct_week}%"></div></div>'
+            f'</div>'
+            f'<div class="stat-foot">Activaciones hoy: <b id="st-tog-{rid}">{r["toggles_today"]}</b></div>'
             f'</div>'
         )
-    else:
-        status_pill = (
-            f'<div class="net-pill net-ap" id="net-pill">'
-            f'Modo AP Activo: <b>{AP_SSID}</b> (http://{HOSTNAME}.local)'
-            f'</div>'
-        )
 
-    welcome_class = "view active" if is_ap_only else "view"
-    relays_class = "view" if is_ap_only else "view active"
-    relays_back_btn = (
-        '<div class="top-nav"><button class="btn-nav-back" onclick="goBack(\'welcome\')">Atrás</button></div>'
-        if is_ap_only
-        else ""
-    )
+    return f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Inicio y Dashboard | SmartPS</title>
+<style>
+{BASE_CSS}
+.section-header {{
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}}
+.section-title {{ font-size: 14px; color: #38bdf8; font-weight: 700; }}
+.btn-reset-stats {{
+  background: rgba(255,255,255,0.05);
+  border: 1px solid rgba(255,255,255,0.12);
+  color: var(--text-muted);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}}
+.btn-reset-stats:hover {{ color: white; border-color: #f87171; }}
+.kpi-grid {{
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 16px;
+}}
+.kpi-card {{
+  background: rgba(15,23,42,0.6);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 12px;
+  padding: 10px 8px;
+  text-align: center;
+}}
+.kpi-label {{ font-size: 11px; color: var(--text-muted); margin-bottom: 4px; display: block; }}
+.kpi-val {{ font-size: 14px; font-weight: 700; color: var(--text-main); }}
+.stat-card {{
+  background: rgba(15,23,42,0.55);
+  border: 1px solid rgba(255,255,255,0.07);
+  border-radius: 12px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+}}
+.stat-head {{
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}}
+.stat-name {{ font-size: 14px; font-weight: 600; color: var(--text-main); }}
+.bar-group {{ margin-bottom: 6px; }}
+.bar-label {{
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 3px;
+}}
+.bar-label b {{ color: var(--text-main); font-weight: 600; }}
+.bar-track {{
+  width: 100%;
+  height: 7px;
+  background: rgba(255,255,255,0.07);
+  border-radius: 4px;
+  overflow: hidden;
+}}
+.bar-fill {{
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.4s ease;
+}}
+.bar-today {{ background: linear-gradient(90deg, #3b82f6, #38bdf8); }}
+.bar-week {{ background: linear-gradient(90deg, #10b981, #34d399); }}
+.stat-foot {{ font-size: 11px; color: var(--text-muted); margin-top: 4px; text-align: right; }}
+.stat-foot b {{ color: var(--text-main); }}
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Multicontacto Inteligente</h1>
+    <p>SmartPS | Pantalla de Inicio</p>
+    {status_pill}
+  </header>
+
+  <div class="menu-actions">
+    <a href="/interruptores" class="btn-hero btn-hero-primary">Interruptores</a>
+    <a href="/red" class="btn-hero btn-hero-secondary">Red Wi-Fi</a>
+  </div>
+
+  <div class="section-header">
+    <span class="section-title">Dashboard de Tiempo de Uso</span>
+    <button class="btn-reset-stats" onclick="resetStats()">Reiniciar Contadores</button>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi-card">
+      <span class="kpi-label">Encendidos</span>
+      <span class="kpi-val" id="kpi-active">{encendidos} de {len(stats_list)}</span>
+    </div>
+    <div class="kpi-card">
+      <span class="kpi-label">Total Hoy</span>
+      <span class="kpi-val" id="kpi-today">{format_duration_py(total_today_sec)}</span>
+    </div>
+    <div class="kpi-card">
+      <span class="kpi-label">Prom. Semanal</span>
+      <span class="kpi-val" id="kpi-week">{format_duration_py(total_week_avg_sec)}</span>
+    </div>
+  </div>
+
+  <div id="stats-list">
+    {dash_cards}
+  </div>
+
+  <footer>
+    <p>Dominio interno: <b>http://{HOSTNAME}.local</b></p>
+  </footer>
+</div>
+
+<script>
+function fmtDur(sec) {{
+  sec = Math.max(0, Math.floor(sec || 0));
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  const pad = n => (n < 10 ? '0' + n : '' + n);
+  if (h > 0) return h + 'h ' + pad(m) + 'm ' + pad(s) + 's';
+  if (m > 0) return m + 'm ' + pad(s) + 's';
+  return s + 's';
+}}
+
+function syncDashboard() {{
+  if (document.hidden) return;
+  fetch('/relays/state')
+    .then(r => r.json())
+    .then(data => {{
+      let onCount = 0;
+      let sumToday = 0;
+      let sumWeek = 0;
+      let maxVal = 60;
+
+      data.forEach(r => {{
+        if (r.is_on) onCount++;
+        sumToday += (r.today_sec || 0);
+        sumWeek += (r.week_avg_sec || 0);
+        if (r.today_sec > maxVal) maxVal = r.today_sec;
+        if (r.week_avg_sec > maxVal) maxVal = r.week_avg_sec;
+      }});
+
+      document.getElementById('kpi-active').textContent = onCount + ' de ' + data.length;
+      document.getElementById('kpi-today').textContent = fmtDur(sumToday);
+      document.getElementById('kpi-week').textContent = fmtDur(sumWeek);
+
+      data.forEach(r => {{
+        const b = document.getElementById('st-badge-' + r.id);
+        if (b) {{
+          b.className = r.is_on ? 'badge badge-on' : 'badge badge-off';
+          b.textContent = r.is_on ? 'ENCENDIDO' : 'APAGADO';
+        }}
+        const n = document.getElementById('st-name-' + r.id);
+        if (n && r.name) n.textContent = r.name;
+
+        const tEl = document.getElementById('st-today-' + r.id);
+        if (tEl) tEl.textContent = fmtDur(r.today_sec);
+
+        const wEl = document.getElementById('st-week-' + r.id);
+        if (wEl) wEl.textContent = fmtDur(r.week_avg_sec);
+
+        const togEl = document.getElementById('st-tog-' + r.id);
+        if (togEl) togEl.textContent = r.toggles_today || 0;
+
+        const pctT = Math.min(100, Math.floor(((r.today_sec || 0) * 100) / maxVal));
+        const pctW = Math.min(100, Math.floor(((r.week_avg_sec || 0) * 100) / maxVal));
+        const bt = document.getElementById('st-bar-today-' + r.id);
+        const bw = document.getElementById('st-bar-week-' + r.id);
+        if (bt) bt.style.width = pctT + '%';
+        if (bw) bw.style.width = pctW + '%';
+      }});
+    }})
+    .catch(() => {{}});
+}}
+
+function resetStats() {{
+  fetch('/stats/reset')
+    .then(r => r.json())
+    .then(() => syncDashboard())
+    .catch(() => {{}});
+}}
+
+setInterval(syncDashboard, 1500);
+</script>
+</body>
+</html>"""
+
+
+# ------------------------------------------------------------------------------
+# PÁGINA 2: CONTROL DE INTERRUPTORES (Ruta: GET /interruptores)
+# ------------------------------------------------------------------------------
+def generar_html_interruptores() -> str:
+    net_status = get_full_net_status()
+    status_pill = _build_status_pill(net_status)
 
     cards_html = ""
     for r in relays:
@@ -220,7 +725,7 @@ def generar_html() -> str:
         checked = "checked" if r["is_on"] else ""
         badge_class = "badge-on" if r["is_on"] else "badge-off"
         badge_text = "ENCENDIDO" if r["is_on"] else "APAGADO"
-        
+
         cards_html += (
             f'<div class="card" id="card-{rid}">'
             f'<div class="card-info">'
@@ -248,118 +753,9 @@ def generar_html() -> str:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SmartPS | Multicontacto Inteligente</title>
+<title>Interruptores | SmartPS</title>
 <style>
-:root {{
-  --bg-color: #0f172a;
-  --card-bg: #1e293b;
-  --text-main: #f8fafc;
-  --text-muted: #94a3b8;
-  --switch-bg: #334155;
-  --switch-active: #3b82f6;
-}}
-* {{ box-sizing: border-box; margin: 0; padding: 0; }}
-body {{
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  background-color: var(--bg-color);
-  color: var(--text-main);
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  min-height: 100vh;
-  padding: 20px;
-}}
-.container {{
-  width: 100%;
-  max-width: 480px;
-  background: var(--card-bg);
-  border-radius: 20px;
-  padding: 26px 22px;
-  box-shadow: 0 20px 40px rgba(0,0,0,0.4);
-  border: 1px solid rgba(255,255,255,0.08);
-}}
-header {{
-  text-align: center;
-  margin-bottom: 18px;
-  border-bottom: 1px solid rgba(255,255,255,0.1);
-  padding-bottom: 16px;
-}}
-header h1 {{ font-size: 22px; font-weight: 700; color: #38bdf8; }}
-header p {{ font-size: 13px; color: var(--text-muted); margin-top: 4px; }}
-.net-pill {{
-  display: inline-block;
-  margin-top: 10px;
-  font-size: 12px;
-  padding: 5px 12px;
-  border-radius: 20px;
-}}
-.net-ok {{ background: rgba(16,185,129,0.14); color: #34d399; border: 1px solid rgba(16,185,129,0.3); }}
-.net-ap {{ background: rgba(245,158,11,0.15); color: #fbbf24; border: 1px solid rgba(245,158,11,0.35); }}
-.view {{ display: none; }}
-.view.active {{ display: block; }}
-.top-nav {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }}
-.btn-nav-back {{
-  background: rgba(255,255,255,0.07);
-  border: 1px solid rgba(255,255,255,0.16);
-  color: var(--text-main);
-  border-radius: 8px;
-  padding: 7px 14px;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-}}
-.btn-nav-back:hover {{ background: rgba(255,255,255,0.13); border-color: rgba(56,189,248,0.4); }}
-.wifi-tabs {{ display: flex; gap: 8px; margin-bottom: 14px; }}
-.tab-btn {{
-  flex: 1;
-  padding: 9px 10px;
-  border-radius: 9px;
-  border: 1px solid rgba(255,255,255,0.12);
-  background: rgba(15,23,42,0.5);
-  color: var(--text-muted);
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-}}
-.tab-btn.active {{
-  background: rgba(56,189,248,0.16);
-  color: #38bdf8;
-  border-color: rgba(56,189,248,0.45);
-}}
-.info-list {{
-  background: rgba(15,23,42,0.55);
-  border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 12px;
-  padding: 6px 14px;
-  margin-bottom: 14px;
-}}
-.info-row {{
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 9px 0;
-  border-bottom: 1px solid rgba(255,255,255,0.06);
-  font-size: 13px;
-}}
-.info-row:last-child {{ border-bottom: none; }}
-.info-label {{ color: var(--text-muted); font-size: 12px; }}
-.info-val {{ color: var(--text-main); font-weight: 600; text-align: right; }}
-.section-divider {{ margin-top: 16px; padding-top: 14px; border-top: 1px solid rgba(255,255,255,0.08); }}
-.welcome-box {{ text-align: center; padding: 10px 6px 6px; }}
-.welcome-box h2 {{ font-size: 19px; color: var(--text-main); margin-bottom: 8px; }}
-.welcome-box p {{ font-size: 13px; color: var(--text-muted); line-height: 1.5; margin-bottom: 22px; }}
-.welcome-actions {{ display: flex; flex-direction: column; gap: 12px; }}
-.btn-hero {{
-  width: 100%;
-  padding: 15px 16px;
-  border-radius: 12px;
-  font-size: 15px;
-  font-weight: 700;
-  cursor: pointer;
-  border: none;
-}}
-.btn-hero-wifi {{ background: linear-gradient(135deg, #2563eb, #0284c7); color: white; }}
-.btn-hero-switches {{ background: rgba(255,255,255,0.06); color: var(--text-main); border: 1px solid rgba(255,255,255,0.15); }}
+{BASE_CSS}
 .card {{
   background: rgba(255,255,255,0.03);
   border: 1px solid rgba(255,255,255,0.05);
@@ -385,14 +781,19 @@ header p {{ font-size: 13px; color: var(--text-muted); margin-top: 4px; }}
 }}
 .rename-row {{ display: none; align-items: center; gap: 6px; margin-bottom: 8px; }}
 .rename-row.open {{ display: flex; }}
-.rename-row input {{ padding: 6px 9px; font-size: 13px; border-radius: 6px; }}
+.rename-row input {{
+  width: 100%;
+  padding: 6px 9px;
+  font-size: 13px;
+  border-radius: 6px;
+  border: 1px solid rgba(255,255,255,0.15);
+  background: #0f172a;
+  color: var(--text-main);
+}}
 .btn-mini {{ border: none; border-radius: 6px; padding: 6px 9px; font-size: 12px; font-weight: 600; cursor: pointer; }}
 .btn-mini-ok {{ background: #10b981; color: #052e16; }}
 .btn-mini-cancel {{ background: #475569; color: white; }}
 .pin-info {{ font-size: 11px; color: var(--text-muted); margin-left: 8px; }}
-.badge {{ display: inline-block; font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 12px; text-transform: uppercase; }}
-.badge-on {{ background: rgba(16,185,129,0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.3); }}
-.badge-off {{ background: rgba(100,116,139,0.15); color: #94a3b8; border: 1px solid rgba(100,116,139,0.3); }}
 .switch {{ position: relative; display: inline-block; width: 56px; height: 32px; flex-shrink: 0; }}
 .switch input {{ opacity: 0; width: 0; height: 0; }}
 .slider {{ position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: var(--switch-bg); transition: .25s; border-radius: 34px; }}
@@ -403,127 +804,26 @@ input:checked + .slider:before {{ transform: translateX(24px); }}
 .btn {{ flex: 1; padding: 11px 12px; border: none; border-radius: 10px; font-size: 13px; font-weight: 600; cursor: pointer; }}
 .btn-all-on {{ background-color: #2563eb; color: white; }}
 .btn-all-off {{ background-color: #475569; color: white; }}
-.btn-wifi-toggle {{ width: 100%; margin-top: 12px; background: rgba(56,189,248,0.12); color: #38bdf8; border: 1px solid rgba(56,189,248,0.3); }}
-.wifi-box {{ padding: 16px; background: rgba(15,23,42,0.65); border: 1px solid rgba(255,255,255,0.1); border-radius: 14px; }}
-.wifi-box h4 {{ font-size: 15px; color: #38bdf8; margin-bottom: 12px; }}
-.form-group {{ margin-bottom: 12px; }}
-.form-group label {{ display: block; font-size: 12px; color: var(--text-muted); margin-bottom: 5px; }}
-.input-row {{ display: flex; gap: 8px; }}
-select, input[type="text"], input[type="password"] {{
-  width: 100%;
-  padding: 9px 11px;
-  border-radius: 8px;
-  border: 1px solid rgba(255,255,255,0.15);
-  background: #0f172a;
-  color: var(--text-main);
-  font-size: 13px;
-}}
-.btn-sm {{ padding: 9px 12px; font-size: 12px; border-radius: 8px; border: none; cursor: pointer; background: #334155; color: white; white-space: nowrap; }}
-.btn-save {{ background: #10b981; color: #052e16; font-weight: 700; width: 100%; }}
-.btn-forget {{ background: rgba(239,68,68,0.2); color: #f87171; border: 1px solid rgba(239,68,68,0.35); width: 100%; }}
-.btn-change-net {{ width: 100%; background: #2563eb; color: white; margin-bottom: 10px; }}
-.msg-box {{ display: none; margin-top: 12px; padding: 10px 12px; border-radius: 8px; font-size: 12px; line-height: 1.45; }}
-.msg-ok {{ display: block; background: rgba(16,185,129,0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.35); }}
-.msg-err {{ display: block; background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.35); }}
-.msg-info {{ display: block; background: rgba(56,189,248,0.15); color: #38bdf8; border: 1px solid rgba(56,189,248,0.35); }}
-footer {{ text-align: center; margin-top: 18px; font-size: 11px; color: var(--text-muted); }}
-a {{ color: #38bdf8; }}
 </style>
 </head>
 <body>
 <div class="container">
   <header>
     <h1>Multicontacto Inteligente</h1>
-    <p>SmartPS | ESP32 &amp; MicroPython</p>
+    <p>Control de Interruptores</p>
     {status_pill}
   </header>
 
-  <div id="view-welcome" class="{welcome_class}">
-    <div class="welcome-box">
-      <h2>Bienvenido a SmartPS</h2>
-      <p>El multicontacto no está conectado a ninguna red Wi-Fi y opera en modo Punto de Acceso. Selecciona una opción:</p>
-      <div class="welcome-actions">
-        <button class="btn-hero btn-hero-wifi" onclick="openWifiFromWelcome()">Conectar a una Red Wi-Fi</button>
-        <button class="btn-hero btn-hero-switches" onclick="showView('relays')">Acceder a los Interruptores</button>
-      </div>
-    </div>
+  <div class="top-nav">
+    <a href="/" class="btn-nav-back">Atrás (Inicio)</a>
+    <a href="/red" class="btn-nav-link">Red Wi-Fi</a>
   </div>
 
-  <div id="view-relays" class="{relays_class}">
-    {relays_back_btn}
-    <div id="relays-list">{cards_html}</div>
-    <div class="actions">
-      <button class="btn btn-all-on" onclick="setAll(1)">Encender Todos</button>
-      <button class="btn btn-all-off" onclick="setAll(0)">Apagar Todos</button>
-    </div>
-    <button class="btn btn-wifi-toggle" onclick="openWifiFromRelays()">Configurar Red Wi-Fi</button>
-  </div>
+  <div id="relays-list">{cards_html}</div>
 
-  <div id="view-wifi" class="view">
-    <div class="top-nav">
-      <button class="btn-nav-back" onclick="handleWifiBack()">Atrás</button>
-    </div>
-
-    <div class="wifi-tabs" id="wifi-tabs" style="display: {'flex' if sta_ok else 'none'};">
-      <button class="tab-btn active" id="tab-btn-info" onclick="showWifiSection('info')">Información de Red Actual</button>
-      <button class="tab-btn" id="tab-btn-change" onclick="showWifiSection('change')">Cambio de Red</button>
-    </div>
-
-    <div class="wifi-box" id="wifi-section-info" style="display: {'block' if sta_ok else 'none'};">
-      <h4>Información del ESP32 en la Red Actual</h4>
-      <div class="info-list">
-        <div class="info-row"><span class="info-label">Estado</span><span class="info-val" id="info-state">Conectado (Modo Estación)</span></div>
-        <div class="info-row"><span class="info-label">Red Wi-Fi (SSID)</span><span class="info-val" id="info-ssid">{sta_ssid}</span></div>
-        <div class="info-row"><span class="info-label">Dirección IP (ESP32)</span><span class="info-val" id="info-ip">{sta_ip}</span></div>
-        <div class="info-row"><span class="info-label">Dominio Local</span><span class="info-val">http://{HOSTNAME}.local</span></div>
-        <div class="info-row"><span class="info-label">Puerta de Enlace (Gateway)</span><span class="info-val" id="info-gw">{sta_gw}</span></div>
-        <div class="info-row"><span class="info-label">Máscara de Subred</span><span class="info-val" id="info-mask">{sta_mask}</span></div>
-        <div class="info-row"><span class="info-label">Servidor DNS</span><span class="info-val" id="info-dns">{sta_dns}</span></div>
-        <div class="info-row"><span class="info-label">Intensidad de Señal (RSSI)</span><span class="info-val" id="info-rssi">{rssi_str}</span></div>
-        <div class="info-row"><span class="info-label">Canal Wi-Fi</span><span class="info-val" id="info-chan">{chan_str}</span></div>
-        <div class="info-row"><span class="info-label">Dirección MAC</span><span class="info-val" id="info-mac">{mac_str}</span></div>
-      </div>
-
-      <button class="btn btn-change-net" onclick="showWifiSection('change')">Cambiar de Red Wi-Fi</button>
-
-      <div class="section-divider">
-        <div class="form-group">
-          <label>Para olvidar esta red y volver a Modo AP, ingresa la clave (SmartPS):</label>
-          <input type="password" id="forget-pin" placeholder="Clave de seguridad SmartPS">
-        </div>
-        <button class="btn btn-forget" onclick="forgetWifi()">Olvidar Red Actual</button>
-        <div id="forget-msg" class="msg-box"></div>
-      </div>
-    </div>
-
-    <div class="wifi-box" id="wifi-section-change" style="display: {'none' if sta_ok else 'block'};">
-      <h4>{'Cambiar a otra Red Wi-Fi (2.4 GHz)' if sta_ok else 'Conectar a Red Wi-Fi (2.4 GHz)'}</h4>
-      <div class="form-group">
-        <label>1. Selecciona tu red Wi-Fi:</label>
-        <div class="input-row">
-          <select id="ssid-select" onchange="onSelectNetwork()">
-            <option value="">-- Presiona Buscar redes --</option>
-          </select>
-          <button class="btn-sm" onclick="scanNetworks()" id="btn-scan">Buscar</button>
-        </div>
-      </div>
-      <div class="form-group">
-        <label>Nombre de red (SSID):</label>
-        <input type="text" id="ssid-input" placeholder="Nombre de tu red Wi-Fi">
-      </div>
-      <div class="form-group">
-        <label>2. Contraseña del Wi-Fi:</label>
-        <input type="password" id="wifi-pass" placeholder="Contraseña de tu red">
-      </div>
-      <div class="form-group">
-        <label>3. Clave de Seguridad del Dispositivo (SmartPS):</label>
-        <input type="password" id="admin-pin" placeholder="Ingresa la clave SmartPS">
-      </div>
-      <div class="actions">
-        <button class="btn btn-save" onclick="saveWifi()">Guardar y Conectar</button>
-      </div>
-      <div id="wifi-msg" class="msg-box"></div>
-    </div>
+  <div class="actions">
+    <button class="btn btn-all-on" onclick="setAll(1)">Encender Todos</button>
+    <button class="btn btn-all-off" onclick="setAll(0)">Apagar Todos</button>
   </div>
 
   <footer>
@@ -532,97 +832,17 @@ a {{ color: #38bdf8; }}
 </div>
 
 <script>
-let isConnectedSta = {'true' if sta_ok else 'false'};
-let previousView = isConnectedSta ? 'relays' : 'welcome';
-let currentWifiSection = isConnectedSta ? 'info' : 'change';
-
-function showView(name) {{
-  document.getElementById('view-welcome').className = (name === 'welcome') ? 'view active' : 'view';
-  document.getElementById('view-relays').className = (name === 'relays') ? 'view active' : 'view';
-  document.getElementById('view-wifi').className = (name === 'wifi') ? 'view active' : 'view';
-}}
-
-function goBack(target) {{
-  showView(target || previousView);
-}}
-
-function openWifiFromWelcome() {{
-  previousView = 'welcome';
-  showView('wifi');
-  showWifiSection('change');
-}}
-
-function openWifiFromRelays() {{
-  previousView = 'relays';
-  showView('wifi');
-  if (isConnectedSta) {{
-    refreshNetworkInfo();
-    showWifiSection('info');
-  }} else {{
-    showWifiSection('change');
-  }}
-}}
-
-function handleWifiBack() {{
-  if (isConnectedSta && currentWifiSection === 'change') {{
-    showWifiSection('info');
-  }} else {{
-    showView(previousView);
-  }}
-}}
-
-function showWifiSection(section) {{
-  currentWifiSection = section;
-  const infoBox = document.getElementById('wifi-section-info');
-  const changeBox = document.getElementById('wifi-section-change');
-  const tabInfo = document.getElementById('tab-btn-info');
-  const tabChange = document.getElementById('tab-btn-change');
-
-  if (section === 'info' && isConnectedSta) {{
-    infoBox.style.display = 'block';
-    changeBox.style.display = 'none';
-    if (tabInfo) tabInfo.className = 'tab-btn active';
-    if (tabChange) tabChange.className = 'tab-btn';
-  }} else {{
-    infoBox.style.display = 'none';
-    changeBox.style.display = 'block';
-    if (tabInfo) tabInfo.className = 'tab-btn';
-    if (tabChange) tabChange.className = 'tab-btn active';
-    if (document.getElementById('ssid-select').options.length <= 1) {{
-      scanNetworks();
-    }}
-  }}
-}}
-
-function refreshNetworkInfo() {{
-  fetch('/wifi/status')
-    .then(r => r.json())
-    .then(st => {{
-      if (st.sta_connected) {{
-        document.getElementById('info-ssid').textContent = st.sta_ssid || '-';
-        document.getElementById('info-ip').textContent = st.sta_ip || '-';
-        document.getElementById('info-gw').textContent = st.sta_gateway || '-';
-        document.getElementById('info-mask').textContent = st.sta_netmask || '-';
-        document.getElementById('info-dns').textContent = st.sta_dns || '-';
-        document.getElementById('info-rssi').textContent = (st.sta_rssi !== null && st.sta_rssi !== undefined) ? (st.sta_rssi + ' dBm') : 'N/D';
-        document.getElementById('info-chan').textContent = (st.sta_channel !== null && st.sta_channel !== undefined) ? ('Canal ' + st.sta_channel + ' (2.4 GHz)') : '2.4 GHz';
-        document.getElementById('info-mac').textContent = st.mac || 'N/D';
-      }}
-    }})
-    .catch(err => console.error(err));
-}}
-
 function toggleRelay(id, state) {{
   const val = state ? 1 : 0;
   fetch('/set?id=' + id + '&val=' + val)
-    .then(response => response.json())
-    .then(data => updateBadge(data.id, data.is_on))
-    .catch(err => console.error('Error al conmutar:', err));
+    .then(r => r.json())
+    .then(d => updateBadge(d.id, d.is_on))
+    .catch(err => console.error(err));
 }}
 
 function setAll(val) {{
   fetch('/set_all?val=' + val)
-    .then(response => response.json())
+    .then(r => r.json())
     .then(data => {{
       data.forEach(r => {{
         const sw = document.getElementById('switch-' + r.id);
@@ -666,7 +886,234 @@ function saveRename(id) {{
         closeRename(id);
       }}
     }})
-    .catch(err => console.error('Error al renombrar:', err));
+    .catch(err => console.error(err));
+}}
+
+function syncRelaysState() {{
+  if (document.hidden) return;
+  fetch('/relays/state')
+    .then(r => r.json())
+    .then(data => {{
+      data.forEach(r => {{
+        const sw = document.getElementById('switch-' + r.id);
+        if (sw && sw.checked !== r.is_on) sw.checked = r.is_on;
+        updateBadge(r.id, r.is_on);
+        const row = document.getElementById('rename-row-' + r.id);
+        const isEditing = row && row.classList.contains('open');
+        const nameEl = document.getElementById('name-text-' + r.id);
+        if (nameEl && !isEditing && r.name && nameEl.textContent !== r.name) {{
+          nameEl.textContent = r.name;
+          const inp = document.getElementById('rename-input-' + r.id);
+          if (inp) inp.value = r.name;
+        }}
+      }});
+    }})
+    .catch(() => {{}});
+}}
+setInterval(syncRelaysState, 1500);
+</script>
+</body>
+</html>"""
+
+
+# ------------------------------------------------------------------------------
+# PÁGINA 3: INFORMACIÓN Y CONFIGURACIÓN DE RED WI-FI (Ruta: GET /red)
+# ------------------------------------------------------------------------------
+def generar_html_red() -> str:
+    net_status = get_full_net_status()
+    sta_ok = bool(net_status.get("sta_connected"))
+    status_pill = _build_status_pill(net_status)
+
+    sta_ssid = html_escape(net_status.get("sta_ssid", "-"))
+    sta_ip = html_escape(net_status.get("sta_ip", "-"))
+    sta_gw = html_escape(net_status.get("sta_gateway", "-"))
+    sta_mask = html_escape(net_status.get("sta_netmask", "-"))
+    sta_dns = html_escape(net_status.get("sta_dns", "-"))
+    rssi_val = net_status.get("sta_rssi")
+    chan_val = net_status.get("sta_channel")
+    rssi_str = f"{rssi_val} dBm" if rssi_val is not None else "N/D"
+    chan_str = f"Canal {chan_val} (2.4 GHz)" if chan_val is not None else "2.4 GHz"
+    mac_str = html_escape(net_status.get("mac") or "N/D")
+
+    return f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Red Wi-Fi | SmartPS</title>
+<style>
+{BASE_CSS}
+.wifi-tabs {{ display: flex; gap: 8px; margin-bottom: 14px; }}
+.tab-btn {{
+  flex: 1;
+  padding: 9px 10px;
+  border-radius: 9px;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(15,23,42,0.5);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}}
+.tab-btn.active {{
+  background: rgba(56,189,248,0.16);
+  color: #38bdf8;
+  border-color: rgba(56,189,248,0.45);
+}}
+.wifi-box {{ padding: 16px; background: rgba(15,23,42,0.65); border: 1px solid rgba(255,255,255,0.1); border-radius: 14px; }}
+.wifi-box h4 {{ font-size: 15px; color: #38bdf8; margin-bottom: 12px; }}
+.form-group {{ margin-bottom: 12px; }}
+.form-group label {{ display: block; font-size: 12px; color: var(--text-muted); margin-bottom: 5px; }}
+.input-row {{ display: flex; gap: 8px; }}
+select, input[type="text"], input[type="password"] {{
+  width: 100%;
+  padding: 9px 11px;
+  border-radius: 8px;
+  border: 1px solid rgba(255,255,255,0.15);
+  background: #0f172a;
+  color: var(--text-main);
+  font-size: 13px;
+}}
+.btn {{ padding: 11px 12px; border: none; border-radius: 10px; font-size: 13px; font-weight: 600; cursor: pointer; }}
+.btn-sm {{ padding: 9px 12px; font-size: 12px; border-radius: 8px; border: none; cursor: pointer; background: #334155; color: white; white-space: nowrap; }}
+.btn-save {{ background: #10b981; color: #052e16; font-weight: 700; width: 100%; margin-top: 6px; }}
+.btn-forget {{ background: rgba(239,68,68,0.2); color: #f87171; border: 1px solid rgba(239,68,68,0.35); width: 100%; }}
+.btn-change-net {{ width: 100%; background: #2563eb; color: white; margin-bottom: 10px; }}
+.section-divider {{ margin-top: 16px; padding-top: 14px; border-top: 1px solid rgba(255,255,255,0.08); }}
+.msg-box {{ display: none; margin-top: 12px; padding: 10px 12px; border-radius: 8px; font-size: 12px; line-height: 1.45; }}
+.msg-ok {{ display: block; background: rgba(16,185,129,0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.35); }}
+.msg-err {{ display: block; background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.35); }}
+.msg-info {{ display: block; background: rgba(56,189,248,0.15); color: #38bdf8; border: 1px solid rgba(56,189,248,0.35); }}
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Multicontacto Inteligente</h1>
+    <p>Gestión de Red Wi-Fi</p>
+    {status_pill}
+  </header>
+
+  <div class="top-nav">
+    <button class="btn-nav-back" onclick="handleBack()">Atrás</button>
+    <a href="/interruptores" class="btn-nav-link">Interruptores</a>
+  </div>
+
+  <div class="wifi-tabs" id="wifi-tabs" style="display: {'flex' if sta_ok else 'none'};">
+    <button class="tab-btn active" id="tab-btn-info" onclick="showSection('info')">Información de Red Actual</button>
+    <button class="tab-btn" id="tab-btn-change" onclick="showSection('change')">Cambio de Red</button>
+  </div>
+
+  <div class="wifi-box" id="wifi-section-info" style="display: {'block' if sta_ok else 'none'};">
+    <h4>Información del ESP32 en la Red Actual</h4>
+    <div class="info-list">
+      <div class="info-row"><span class="info-label">Estado</span><span class="info-val" id="info-state">Conectado (Modo Estación)</span></div>
+      <div class="info-row"><span class="info-label">Red Wi-Fi (SSID)</span><span class="info-val" id="info-ssid">{sta_ssid}</span></div>
+      <div class="info-row"><span class="info-label">Dirección IP (ESP32)</span><span class="info-val" id="info-ip">{sta_ip}</span></div>
+      <div class="info-row"><span class="info-label">Dominio Local</span><span class="info-val">http://{HOSTNAME}.local</span></div>
+      <div class="info-row"><span class="info-label">Puerta de Enlace (Gateway)</span><span class="info-val" id="info-gw">{sta_gw}</span></div>
+      <div class="info-row"><span class="info-label">Máscara de Subred</span><span class="info-val" id="info-mask">{sta_mask}</span></div>
+      <div class="info-row"><span class="info-label">Servidor DNS</span><span class="info-val" id="info-dns">{sta_dns}</span></div>
+      <div class="info-row"><span class="info-label">Intensidad de Señal (RSSI)</span><span class="info-val" id="info-rssi">{rssi_str}</span></div>
+      <div class="info-row"><span class="info-label">Canal Wi-Fi</span><span class="info-val" id="info-chan">{chan_str}</span></div>
+      <div class="info-row"><span class="info-label">Dirección MAC</span><span class="info-val" id="info-mac">{mac_str}</span></div>
+    </div>
+
+    <button class="btn btn-change-net" onclick="showSection('change')">Cambiar de Red Wi-Fi</button>
+
+    <div class="section-divider">
+      <div class="form-group">
+        <label>Para olvidar esta red y volver a Modo AP, ingresa la clave (SmartPS):</label>
+        <input type="password" id="forget-pin" placeholder="Clave de seguridad SmartPS">
+      </div>
+      <button class="btn btn-forget" onclick="forgetWifi()">Olvidar Red Actual</button>
+      <div id="forget-msg" class="msg-box"></div>
+    </div>
+  </div>
+
+  <div class="wifi-box" id="wifi-section-change" style="display: {'none' if sta_ok else 'block'};">
+    <h4>{'Cambiar a otra Red Wi-Fi (2.4 GHz)' if sta_ok else 'Conectar a Red Wi-Fi (2.4 GHz)'}</h4>
+    <div class="form-group">
+      <label>1. Selecciona tu red Wi-Fi:</label>
+      <div class="input-row">
+        <select id="ssid-select" onchange="onSelectNetwork()">
+          <option value="">-- Presiona Buscar redes --</option>
+        </select>
+        <button class="btn-sm" onclick="scanNetworks()" id="btn-scan">Buscar</button>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>Nombre de red (SSID):</label>
+      <input type="text" id="ssid-input" placeholder="Nombre de tu red Wi-Fi">
+    </div>
+    <div class="form-group">
+      <label>2. Contraseña del Wi-Fi:</label>
+      <input type="password" id="wifi-pass" placeholder="Contraseña de tu red">
+    </div>
+    <div class="form-group">
+      <label>3. Clave de Seguridad del Dispositivo (SmartPS):</label>
+      <input type="password" id="admin-pin" placeholder="Ingresa la clave SmartPS">
+    </div>
+    <button class="btn btn-save" onclick="saveWifi()">Guardar y Conectar</button>
+    <div id="wifi-msg" class="msg-box"></div>
+  </div>
+
+  <footer>
+    <p>Dominio interno: <b>http://{HOSTNAME}.local</b></p>
+  </footer>
+</div>
+
+<script>
+let isConnectedSta = {'true' if sta_ok else 'false'};
+let currentSection = isConnectedSta ? 'info' : 'change';
+
+function handleBack() {{
+  if (isConnectedSta && currentSection === 'change') {{
+    showSection('info');
+  }} else {{
+    window.location.href = '/';
+  }}
+}}
+
+function showSection(section) {{
+  currentSection = section;
+  const infoBox = document.getElementById('wifi-section-info');
+  const changeBox = document.getElementById('wifi-section-change');
+  const tabInfo = document.getElementById('tab-btn-info');
+  const tabChange = document.getElementById('tab-btn-change');
+
+  if (section === 'info' && isConnectedSta) {{
+    infoBox.style.display = 'block';
+    changeBox.style.display = 'none';
+    if (tabInfo) tabInfo.className = 'tab-btn active';
+    if (tabChange) tabChange.className = 'tab-btn';
+  }} else {{
+    infoBox.style.display = 'none';
+    changeBox.style.display = 'block';
+    if (tabInfo) tabInfo.className = 'tab-btn';
+    if (tabChange) tabChange.className = 'tab-btn active';
+    if (document.getElementById('ssid-select').options.length <= 1) {{
+      scanNetworks();
+    }}
+  }}
+}}
+
+function refreshNetworkInfo() {{
+  fetch('/wifi/status')
+    .then(r => r.json())
+    .then(st => {{
+      if (st.sta_connected) {{
+        document.getElementById('info-ssid').textContent = st.sta_ssid || '-';
+        document.getElementById('info-ip').textContent = st.sta_ip || '-';
+        document.getElementById('info-gw').textContent = st.sta_gateway || '-';
+        document.getElementById('info-mask').textContent = st.sta_netmask || '-';
+        document.getElementById('info-dns').textContent = st.sta_dns || '-';
+        document.getElementById('info-rssi').textContent = (st.sta_rssi !== null && st.sta_rssi !== undefined) ? (st.sta_rssi + ' dBm') : 'N/D';
+        document.getElementById('info-chan').textContent = (st.sta_channel !== null && st.sta_channel !== undefined) ? ('Canal ' + st.sta_channel + ' (2.4 GHz)') : '2.4 GHz';
+        document.getElementById('info-mac').textContent = st.mac || 'N/D';
+      }}
+    }})
+    .catch(() => {{}});
 }}
 
 function showMsg(text, type, boxId) {{
@@ -775,14 +1222,19 @@ function forgetWifi() {{
         showMsg('Error: ' + res.error, 'msg-err', 'forget-msg');
       }}
     }})
-    .catch(err => console.error(err));
+    .catch(() => {{}});
+}}
+
+if (!isConnectedSta) {{
+  scanNetworks();
 }}
 </script>
 </body>
 </html>"""
 
+
 # ==============================================================================
-# 5. SERVIDOR WEB Y ATENCIÓN DE PETICIONES
+# 5. SERVIDOR WEB Y ENRUTADOR DE PÁGINAS Y API
 # ==============================================================================
 
 def url_decode(val: str) -> str:
@@ -822,7 +1274,7 @@ def parse_query_params(path):
     return params
 
 def send_all_chunks(conn, data_bytes: bytes):
-    """Envía bytes en bloques de 1024B para evitar desbordamiento de buffer TCP en MicroPython."""
+    """Envía bytes en bloques de 1024B para evitar desbordamiento de buffer TCP."""
     mv = memoryview(data_bytes)
     total = len(data_bytes)
     sent = 0
@@ -844,21 +1296,42 @@ def send_json(conn, payload_obj, status="200 OK"):
     send_all_chunks(conn, headers)
     send_all_chunks(conn, body)
 
+def send_html(conn, html_str: str):
+    gc.collect()
+    html_bytes = html_str.encode("utf-8")
+    headers = (
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=UTF-8\r\n"
+        f"Content-Length: {len(html_bytes)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("utf-8")
+    send_all_chunks(conn, headers)
+    send_all_chunks(conn, html_bytes)
+
 def iniciar_servidor():
+    if wifi.sta.isconnected():
+        sync_ntp_time()
+        usage_stats["current_day"] = get_current_day_key()
+
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(('', 80))
     s.listen(5)
-    # Timeout corto para intercalar atención HTTP (puerto 80) y DNS local (puerto 53)
     s.settimeout(0.05)
     print(f"Servidor web activo en http://{HOSTNAME}.local (Puerto 80)...\n")
 
     gc_counter = 0
+    last_stats_flush = time.time()
+
     while True:
         conn = None
         try:
-            # Procesar consultas DNS del dominio interno y tareas del WiFiManager
             wifi.tick()
+
+            now = time.time()
+            if now - last_stats_flush >= 60:
+                last_stats_flush = now
+                update_active_timers(save_to_disk=True)
 
             gc_counter += 1
             if gc_counter >= 50:
@@ -868,7 +1341,6 @@ def iniciar_servidor():
             try:
                 conn, addr = s.accept()
             except OSError:
-                # No hay nueva conexión HTTP en este ciclo (timeout de 50ms)
                 continue
 
             conn.settimeout(5.0)
@@ -886,17 +1358,17 @@ def iniciar_servidor():
                 continue
                 
             path = parts[1]
+            clean_route = path.split('?')[0]
             client_ip = addr[0]
 
-            # Extraer cabecera Host (ej. smartps.local o 192.168.4.1)
             host_header = ""
             for line in request.split('\r\n')[1:]:
                 if line.lower().startswith('host:'):
                     host_header = line.split(':', 1)[1].strip()
                     break
             
-            # 1. Ignorar solicitudes de favicon para ahorrar tiempo y recursos
-            if path == '/favicon.ico':
+            # 1. Ignorar solicitudes de favicon
+            if clean_route == '/favicon.ico':
                 conn.send(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
                 conn.close()
                 continue
@@ -924,12 +1396,25 @@ def iniciar_servidor():
                 for r in relays:
                     set_relay(r["id"], bool(val))
                 
-                items = [{"id": r["id"], "is_on": r["is_on"]} for r in relays]
-                send_json(conn, items)
+                send_json(conn, get_relays_state_with_stats())
                 conn.close()
                 continue
 
-            # 4. Endpoint API: Personalizar nombre de un contacto (/rename?id=0&name=...)
+            # 4. Endpoint API: Sincronización de estado y estadísticas en tiempo real (/relays/state)
+            if clean_route == '/relays/state':
+                send_json(conn, get_relays_state_with_stats())
+                conn.close()
+                continue
+
+            # 4B. Endpoint API: Reiniciar estadísticas de uso (/stats/reset)
+            if clean_route == '/stats/reset':
+                print(f"[WEB] Cliente {client_ip} -> Reiniciando estadísticas de uso")
+                reset_usage_stats()
+                send_json(conn, {"ok": True})
+                conn.close()
+                continue
+
+            # 5. Endpoint API: Personalizar nombre de un contacto (/rename?id=0&name=...)
             if path.startswith('/rename?'):
                 params = parse_query_params(path)
                 relay_id = int(params.get('id', -1))
@@ -941,15 +1426,15 @@ def iniciar_servidor():
                 conn.close()
                 continue
 
-            # 5. Endpoint Wi-Fi: Escanear redes cercanas (/wifi/scan)
-            if path.startswith('/wifi/scan'):
+            # 6. Endpoint Wi-Fi: Escanear redes cercanas (/wifi/scan)
+            if clean_route == '/wifi/scan':
                 print(f"[WEB] Cliente {client_ip} -> Escaneando redes Wi-Fi cercanas...")
                 networks = wifi.scan_networks()
                 send_json(conn, networks)
                 conn.close()
                 continue
 
-            # 6. Endpoint Wi-Fi: Guardar y conectar a nueva red (/wifi/save?ssid=...&pass=...&pin=...)
+            # 7. Endpoint Wi-Fi: Guardar y conectar a nueva red (/wifi/save?ssid=...&pass=...&pin=...)
             if path.startswith('/wifi/save?'):
                 params = parse_query_params(path)
                 ssid = params.get('ssid', '').strip()
@@ -957,11 +1442,13 @@ def iniciar_servidor():
                 pin = params.get('pin', '').strip()
                 print(f"[WEB] Cliente {client_ip} -> Solicitud de conexión a red '{ssid}'")
                 result = wifi.configure_new_network(ssid, password, pin)
+                if result.get("ok"):
+                    sync_ntp_time()
                 send_json(conn, result)
                 conn.close()
                 continue
 
-            # 7. Endpoint Wi-Fi: Olvidar red actual y volver a modo AP (/wifi/forget?pin=...)
+            # 8. Endpoint Wi-Fi: Olvidar red actual y volver a modo AP (/wifi/forget?pin=...)
             if path.startswith('/wifi/forget?'):
                 params = parse_query_params(path)
                 pin = params.get('pin', '').strip()
@@ -975,24 +1462,28 @@ def iniciar_servidor():
                 conn.close()
                 continue
 
-            # 8. Endpoint Wi-Fi: Consultar estado actual (/wifi/status)
-            if path.startswith('/wifi/status'):
+            # 9. Endpoint Wi-Fi: Consultar estado actual (/wifi/status)
+            if clean_route == '/wifi/status':
                 send_json(conn, get_full_net_status())
                 conn.close()
                 continue
 
-            # 9. Ruta Principal (y detección de Portal Cautivo): Retornar interfaz HTML
-            print(f"[WEB] Acceso a página principal desde {client_ip} (Host: {host_header or 'directo'} | Ruta: {path})")
-            gc.collect()
-            html_bytes = generar_html().encode('utf-8')
-            response_headers = (
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/html; charset=UTF-8\r\n"
-                f"Content-Length: {len(html_bytes)}\r\n"
-                "Connection: close\r\n\r\n"
-            ).encode('utf-8')
-            send_all_chunks(conn, response_headers)
-            send_all_chunks(conn, html_bytes)
+            # 10. RUTAS DE PÁGINAS HTML SEPARADAS
+            if clean_route == '/interruptores':
+                print(f"[WEB] Cliente {client_ip} -> Página de Interruptores (/interruptores)")
+                send_html(conn, generar_html_interruptores())
+                conn.close()
+                continue
+
+            if clean_route == '/red':
+                print(f"[WEB] Cliente {client_ip} -> Página de Red Wi-Fi (/red)")
+                send_html(conn, generar_html_red())
+                conn.close()
+                continue
+
+            # Ruta Principal '/' (y cualquier ruta de Portal Cautivo): Pantalla de Inicio con Dashboard
+            print(f"[WEB] Cliente {client_ip} -> Pantalla de Inicio y Dashboard ({clean_route} | Host: {host_header or 'directo'})")
+            send_html(conn, generar_html_inicio())
             conn.close()
 
         except Exception as e:

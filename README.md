@@ -203,9 +203,10 @@ Cuando enciendes el multicontacto por primera vez (o lo llevas a un lugar nuevo 
    * **Nombre de red (SSID):** `SmartPS`
    * **Contraseña del Wi-Fi:** `SmartPS123`
 3. **Abre la interfaz web en tu navegador (`http://smartps.local` o `http://192.168.4.1`):**
-   Al estar en Modo Punto de Acceso (sin red Wi-Fi conectada), aparecerá una **Pantalla de Inicio** con dos opciones:
-   * **Conectar a una Red Wi-Fi:** Abre el buscador de redes para vincular el multicontacto a tu módem.
-   * **Acceder a los Interruptores:** Te lleva directamente al tablero de control para prender/apagar los 4 contactos y personalizar sus nombres.
+   El servidor del ESP32 expone tres páginas en rutas independientes:
+   * **`http://smartps.local/` (Pantalla de Inicio):** Muestra el resumen general del sistema, modo de operación, dirección IP, conteo y estado en vivo de los 4 contactos, y los botones para navegar a las demás secciones.
+   * **`http://smartps.local/interruptores` (Control de Interruptores):** Tablero para encender/apagar contactos individualmente o en grupo y personalizar sus nombres (con sincronización automática entre dispositivos).
+   * **`http://smartps.local/red` (Gestión de Red Wi-Fi):** Dividida en **Información de Red Actual** (IP, Gateway, Máscara, DNS, RSSI, Canal y MAC) y **Cambio de Red**.
 4. **Vincula el multicontacto al Wi-Fi de tu casa/escuela:**
    * En la pantalla de configuración de red, el panel buscará automáticamente las redes Wi-Fi **2.4 GHz** cercanas. Selecciona tu red de la lista desplegable.
    * Escribe la **contraseña de tu red Wi-Fi**.
