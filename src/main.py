@@ -30,6 +30,9 @@ HOSTNAME = 'smartps'         # Dominio interno: http://smartps.local
 WIFI_SSID = 'TU_RED_WIFI'
 WIFI_PASSWORD = 'TU_CONTRASEÑA'
 
+# Archivo donde se guardan los nombres personalizados de cada contacto
+NAMES_FILE = 'relays_names.json'
+
 # NOTA DE SEGURIDAD SOBRE RELEVADORES:
 # La gran mayoría de los módulos de relevadores de 5V para Arduino/ESP32 son
 # ACTIVOS EN BAJO (Active LOW), lo que significa:
@@ -38,19 +41,39 @@ WIFI_PASSWORD = 'TU_CONTRASEÑA'
 # Si tu módulo es Activo en Alto (Active HIGH), cambia esta variable a False.
 RELAY_ACTIVE_LOW = True
 
-# Asignación de pines GPIO y nombres para cada contacto.
+# Asignación de pines GPIO y nombres por defecto para cada contacto.
 # En ESP32-S3, los pines 19 y 20 corresponden al puerto USB nativo (D- y D+),
 # por lo que se usan los pines consecutivos seguros 15, 16, 17 y 18.
 RELAYS_CONFIG = [
-    {"id": 0, "name": "Contacto 1 (Lámpara)", "pin": 15},
-    {"id": 1, "name": "Contacto 2 (Cargador)", "pin": 16},
-    {"id": 2, "name": "Contacto 3 (Monitor)", "pin": 17},
-    {"id": 3, "name": "Contacto 4 (Auxiliar)", "pin": 18},
+    {"id": 0, "name": "Contacto 1", "pin": 15},
+    {"id": 1, "name": "Contacto 2", "pin": 16},
+    {"id": 2, "name": "Contacto 3", "pin": 17},
+    {"id": 3, "name": "Contacto 4", "pin": 18},
 ]
 
 # ==============================================================================
-# 2. INICIALIZACIÓN DE HARDWARE (RELEVADORES)
+# 2. INICIALIZACIÓN DE HARDWARE Y NOMBRES PERSONALIZADOS
 # ==============================================================================
+
+def load_custom_names() -> dict:
+    """Carga los nombres personalizados de los contactos desde la memoria Flash."""
+    try:
+        with open(NAMES_FILE, "r") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+def save_custom_names():
+    """Guarda los nombres actuales de los contactos en la memoria Flash."""
+    try:
+        data = {str(r["id"]): r["name"] for r in relays}
+        with open(NAMES_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"Error al guardar nombres: {e}")
 
 def get_physical_value(is_on: bool) -> int:
     """Convierte el estado lógico deseado (True=Encendido, False=Apagado) al nivel físico del pin."""
@@ -59,15 +82,17 @@ def get_physical_value(is_on: bool) -> int:
     else:
         return 1 if is_on else 0
 
+saved_names = load_custom_names()
 relays = []
 for config in RELAYS_CONFIG:
     pin_obj = Pin(config["pin"], Pin.OUT)
     # Por seguridad, asegurar que todos los relevadores inicien APAGADOS (circuito abierto)
     pin_obj.value(get_physical_value(False))
+    custom_name = saved_names.get(str(config["id"]), config["name"])
     
     relays.append({
         "id": config["id"],
-        "name": config["name"],
+        "name": custom_name,
         "pin_num": config["pin"],
         "pin_obj": pin_obj,
         "is_on": False
@@ -80,12 +105,14 @@ def set_relay(relay_id: int, state: bool):
         relays[relay_id]["pin_obj"].value(get_physical_value(state))
         print(f"[{relays[relay_id]['name']}] -> {'ENCENDIDO' if state else 'APAGADO'}")
 
-def toggle_relay(relay_id: int) -> bool:
-    """Alterna el estado del relevador indicado y retorna el nuevo estado."""
-    if 0 <= relay_id < len(relays):
-        new_state = not relays[relay_id]["is_on"]
-        set_relay(relay_id, new_state)
-        return new_state
+def rename_relay(relay_id: int, new_name: str) -> bool:
+    """Cambia y guarda el nombre personalizado de un contacto."""
+    clean_name = new_name.strip()
+    if 0 <= relay_id < len(relays) and clean_name:
+        relays[relay_id]["name"] = clean_name[:32]
+        save_custom_names()
+        print(f"[Contacto {relay_id + 1}] renombrado a: '{relays[relay_id]['name']}'")
+        return True
     return False
 
 # ==============================================================================
@@ -105,13 +132,23 @@ wifi = WiFiManager(
 # 4. GENERACIÓN DE LA INTERFAZ WEB (HTML + CSS + JavaScript)
 # ==============================================================================
 
+def html_escape(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
 def generar_html():
-    """Genera la interfaz web con control de relevadores y panel de configuración Wi-Fi."""
+    """Genera la interfaz web con pantalla de inicio en modo AP, interruptores editables y gestor Wi-Fi."""
     net_status = wifi.get_status()
+    is_ap_only = not net_status["sta_connected"]
+
     if net_status["sta_connected"]:
         status_pill = (
             f'<div class="net-pill net-ok" id="net-pill">'
-            f'📶 Conectado a <b>{net_status["sta_ssid"]}</b> ({net_status["sta_ip"]})'
+            f'📶 Conectado a <b>{html_escape(net_status["sta_ssid"])}</b> ({net_status["sta_ip"]})'
             f'</div>'
         )
     else:
@@ -121,21 +158,35 @@ def generar_html():
             f'</div>'
         )
 
+    # Si está en Modo AP (sin red Wi-Fi conectada), mostrar primero la pantalla de bienvenida
+    welcome_class = "view active" if is_ap_only else "view"
+    relays_class = "view" if is_ap_only else "view active"
+
     cards_html = ""
     for r in relays:
+        rid = r["id"]
+        safe_name = html_escape(r["name"])
         checked = "checked" if r["is_on"] else ""
         badge_class = "badge-on" if r["is_on"] else "badge-off"
         badge_text = "ENCENDIDO" if r["is_on"] else "APAGADO"
         
         cards_html += f"""
-        <div class="card" id="card-{r['id']}">
+        <div class="card" id="card-{rid}">
             <div class="card-info">
-                <h3>{r['name']}</h3>
-                <span class="badge {badge_class}" id="badge-{r['id']}">{badge_text}</span>
+                <div class="title-row" id="title-row-{rid}">
+                    <h3 id="name-text-{rid}">{safe_name}</h3>
+                    <button class="btn-icon" onclick="openRename({rid})" title="Cambiar nombre">✏️</button>
+                </div>
+                <div class="rename-row" id="rename-row-{rid}">
+                    <input type="text" id="rename-input-{rid}" value="{safe_name}" maxlength="32" placeholder="Nombre del contacto">
+                    <button class="btn-mini btn-mini-ok" onclick="saveRename({rid})">✓</button>
+                    <button class="btn-mini btn-mini-cancel" onclick="closeRename({rid})">✕</button>
+                </div>
+                <span class="badge {badge_class}" id="badge-{rid}">{badge_text}</span>
                 <span class="pin-info">GPIO {r['pin_num']}</span>
             </div>
             <label class="switch">
-                <input type="checkbox" id="switch-{r['id']}" {checked} onchange="toggleRelay({r['id']}, this.checked)">
+                <input type="checkbox" id="switch-{rid}" {checked} onchange="toggleRelay({rid}, this.checked)">
                 <span class="slider"></span>
             </label>
         </div>
@@ -196,6 +247,58 @@ def generar_html():
         .net-ok {{ background: rgba(16, 185, 129, 0.14); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }}
         .net-ap {{ background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.35); }}
 
+        /* Vistas */
+        .view {{ display: none; }}
+        .view.active {{ display: block; }}
+
+        /* Pantalla de Inicio en Modo AP */
+        .welcome-box {{
+            text-align: center;
+            padding: 10px 6px 6px;
+        }}
+        .welcome-icon {{
+            font-size: 42px;
+            margin-bottom: 12px;
+        }}
+        .welcome-box h2 {{
+            font-size: 19px;
+            color: var(--text-main);
+            margin-bottom: 8px;
+        }}
+        .welcome-box p {{
+            font-size: 13px;
+            color: var(--text-muted);
+            line-height: 1.5;
+            margin-bottom: 22px;
+        }}
+        .welcome-actions {{
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }}
+        .btn-hero {{
+            width: 100%;
+            padding: 15px 16px;
+            border-radius: 12px;
+            font-size: 15px;
+            font-weight: 700;
+            cursor: pointer;
+            border: none;
+            transition: transform 0.15s ease, opacity 0.2s;
+        }}
+        .btn-hero:active {{ transform: scale(0.99); opacity: 0.9; }}
+        .btn-hero-wifi {{
+            background: linear-gradient(135deg, #2563eb, #0284c7);
+            color: white;
+            box-shadow: 0 8px 20px rgba(37, 99, 235, 0.35);
+        }}
+        .btn-hero-switches {{
+            background: rgba(255, 255, 255, 0.06);
+            color: var(--text-main);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+        }}
+
+        /* Tarjetas de Contactos */
         .card {{
             background: rgba(255, 255, 255, 0.03);
             border: 1px solid rgba(255, 255, 255, 0.05);
@@ -205,10 +308,58 @@ def generar_html():
             display: flex;
             justify-content: space-between;
             align-items: center;
+            gap: 12px;
             transition: border-color 0.15s ease;
         }}
         .card:hover {{ border-color: rgba(56, 189, 248, 0.3); }}
-        .card-info h3 {{ font-size: 16px; font-weight: 600; margin-bottom: 6px; }}
+        .card-info {{ flex: 1; min-width: 0; }}
+        .title-row {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 6px;
+        }}
+        .title-row h3 {{
+            font-size: 16px;
+            font-weight: 600;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }}
+        .btn-icon {{
+            background: rgba(255, 255, 255, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 6px;
+            color: var(--text-muted);
+            font-size: 12px;
+            padding: 3px 6px;
+            cursor: pointer;
+            flex-shrink: 0;
+        }}
+        .btn-icon:hover {{ color: white; border-color: #38bdf8; }}
+        .rename-row {{
+            display: none;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 8px;
+        }}
+        .rename-row.open {{ display: flex; }}
+        .rename-row input {{
+            padding: 6px 9px;
+            font-size: 13px;
+            border-radius: 6px;
+        }}
+        .btn-mini {{
+            border: none;
+            border-radius: 6px;
+            padding: 6px 10px;
+            font-size: 13px;
+            font-weight: 700;
+            cursor: pointer;
+        }}
+        .btn-mini-ok {{ background: #10b981; color: #052e16; }}
+        .btn-mini-cancel {{ background: #475569; color: white; }}
+
         .pin-info {{ font-size: 11px; color: var(--text-muted); margin-left: 8px; }}
         .badge {{
             display: inline-block;
@@ -280,16 +431,13 @@ def generar_html():
         }}
 
         /* Panel de Configuración Wi-Fi */
-        .wifi-panel {{
-            display: none;
-            margin-top: 16px;
+        .wifi-box {{
             padding: 16px;
             background: rgba(15, 23, 42, 0.65);
             border: 1px solid rgba(255, 255, 255, 0.1);
             border-radius: 14px;
         }}
-        .wifi-panel.open {{ display: block; }}
-        .wifi-panel h4 {{ font-size: 15px; color: #38bdf8; margin-bottom: 12px; }}
+        .wifi-box h4 {{ font-size: 16px; color: #38bdf8; margin-bottom: 14px; }}
         .form-group {{ margin-bottom: 12px; }}
         .form-group label {{
             display: block;
@@ -319,6 +467,13 @@ def generar_html():
         }}
         .btn-save {{ background: #10b981; color: #052e16; font-weight: 700; }}
         .btn-forget {{ background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.35); }}
+        .btn-back {{
+            width: 100%;
+            margin-top: 12px;
+            background: rgba(255, 255, 255, 0.06);
+            color: var(--text-main);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+        }}
         .msg-box {{
             display: none;
             margin-top: 12px;
@@ -342,51 +497,72 @@ def generar_html():
             {status_pill}
         </header>
 
-        <div id="relays-list">
-            {cards_html}
-        </div>
-
-        <div class="actions">
-            <button class="btn btn-all-on" onclick="setAll(1)">Encender Todos</button>
-            <button class="btn btn-all-off" onclick="setAll(0)">Apagar Todos</button>
-        </div>
-
-        <button class="btn btn-wifi-toggle" onclick="toggleWifiPanel()">⚙️ Configurar Red Wi-Fi</button>
-
-        <div class="wifi-panel" id="wifi-panel">
-            <h4>Configuración de Red Wi-Fi (2.4 GHz)</h4>
-
-            <div class="form-group">
-                <label>1. Selecciona tu red Wi-Fi:</label>
-                <div class="input-row">
-                    <select id="ssid-select" onchange="onSelectNetwork()">
-                        <option value="">-- Presiona Buscar redes --</option>
-                    </select>
-                    <button class="btn-sm" onclick="scanNetworks()" id="btn-scan">🔍 Buscar</button>
+        <!-- VISTA 1: Pantalla de Inicio cuando está en Modo AP -->
+        <div id="view-welcome" class="{welcome_class}">
+            <div class="welcome-box">
+                <div class="welcome-icon">📡</div>
+                <h2>Bienvenido a SmartPS</h2>
+                <p>El multicontacto no está conectado a ninguna red Wi-Fi y opera en modo Punto de Acceso. ¿Qué deseas hacer?</p>
+                <div class="welcome-actions">
+                    <button class="btn-hero btn-hero-wifi" onclick="showView('wifi')">📶 Conectar a una Red Wi-Fi</button>
+                    <button class="btn-hero btn-hero-switches" onclick="showView('relays')">🔌 Acceder a los Interruptores</button>
                 </div>
             </div>
+        </div>
 
-            <div class="form-group">
-                <label>Nombre de red (SSID):</label>
-                <input type="text" id="ssid-input" placeholder="Nombre de tu red Wi-Fi">
-            </div>
-
-            <div class="form-group">
-                <label>2. Contraseña del Wi-Fi:</label>
-                <input type="password" id="wifi-pass" placeholder="Contraseña de tu red">
-            </div>
-
-            <div class="form-group">
-                <label>3. Clave de Seguridad del Dispositivo (SmartPS):</label>
-                <input type="password" id="admin-pin" placeholder="Ingresa la clave SmartPS">
+        <!-- VISTA 2: Tablero de Interruptores -->
+        <div id="view-relays" class="{relays_class}">
+            <div id="relays-list">
+                {cards_html}
             </div>
 
             <div class="actions">
-                <button class="btn btn-save" onclick="saveWifi()">Guardar y Conectar</button>
-                <button class="btn btn-forget" onclick="forgetWifi()">Olvidar Red</button>
+                <button class="btn btn-all-on" onclick="setAll(1)">Encender Todos</button>
+                <button class="btn btn-all-off" onclick="setAll(0)">Apagar Todos</button>
             </div>
 
-            <div id="wifi-msg" class="msg-box"></div>
+            <button class="btn btn-wifi-toggle" onclick="showView('wifi')">⚙️ Configurar Red Wi-Fi</button>
+        </div>
+
+        <!-- VISTA 3: Configuración de Red Wi-Fi -->
+        <div id="view-wifi" class="view">
+            <div class="wifi-box">
+                <h4>📶 Configurar Red Wi-Fi (2.4 GHz)</h4>
+
+                <div class="form-group">
+                    <label>1. Selecciona tu red Wi-Fi:</label>
+                    <div class="input-row">
+                        <select id="ssid-select" onchange="onSelectNetwork()">
+                            <option value="">-- Presiona Buscar redes --</option>
+                        </select>
+                        <button class="btn-sm" onclick="scanNetworks()" id="btn-scan">🔍 Buscar</button>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label>Nombre de red (SSID):</label>
+                    <input type="text" id="ssid-input" placeholder="Nombre de tu red Wi-Fi">
+                </div>
+
+                <div class="form-group">
+                    <label>2. Contraseña del Wi-Fi:</label>
+                    <input type="password" id="wifi-pass" placeholder="Contraseña de tu red">
+                </div>
+
+                <div class="form-group">
+                    <label>3. Clave de Seguridad del Dispositivo (SmartPS):</label>
+                    <input type="password" id="admin-pin" placeholder="Ingresa la clave SmartPS">
+                </div>
+
+                <div class="actions">
+                    <button class="btn btn-save" onclick="saveWifi()">Guardar y Conectar</button>
+                    <button class="btn btn-forget" onclick="forgetWifi()">Olvidar Red</button>
+                </div>
+
+                <div id="wifi-msg" class="msg-box"></div>
+
+                <button class="btn btn-back" onclick="showView('relays')">🔌 Ir a los Interruptores</button>
+            </div>
         </div>
 
         <footer>
@@ -395,6 +571,16 @@ def generar_html():
     </div>
 
     <script>
+        function showView(name) {{
+            document.getElementById('view-welcome').className = (name === 'welcome') ? 'view active' : 'view';
+            document.getElementById('view-relays').className = (name === 'relays') ? 'view active' : 'view';
+            document.getElementById('view-wifi').className = (name === 'wifi') ? 'view active' : 'view';
+
+            if (name === 'wifi' && document.getElementById('ssid-select').options.length <= 1) {{
+                scanNetworks();
+            }}
+        }}
+
         function toggleRelay(id, state) {{
             const val = state ? 1 : 0;
             fetch('/set?id=' + id + '&val=' + val)
@@ -430,12 +616,35 @@ def generar_html():
             }}
         }}
 
-        function toggleWifiPanel() {{
-            const panel = document.getElementById('wifi-panel');
-            panel.classList.toggle('open');
-            if (panel.classList.contains('open') && document.getElementById('ssid-select').options.length <= 1) {{
-                scanNetworks();
-            }}
+        function openRename(id) {{
+            document.getElementById('title-row-' + id).style.display = 'none';
+            const row = document.getElementById('rename-row-' + id);
+            row.classList.add('open');
+            const inp = document.getElementById('rename-input-' + id);
+            inp.focus();
+            inp.select();
+        }}
+
+        function closeRename(id) {{
+            document.getElementById('rename-row-' + id).classList.remove('open');
+            document.getElementById('title-row-' + id).style.display = 'flex';
+        }}
+
+        function saveRename(id) {{
+            const inp = document.getElementById('rename-input-' + id);
+            const newName = inp.value.trim();
+            if (!newName) return;
+
+            fetch('/rename?id=' + id + '&name=' + encodeURIComponent(newName))
+                .then(r => r.json())
+                .then(res => {{
+                    if (res.ok) {{
+                        document.getElementById('name-text-' + id).textContent = res.name;
+                        inp.value = res.name;
+                        closeRename(id);
+                    }}
+                }})
+                .catch(err => console.error('Error al renombrar:', err));
         }}
 
         function showMsg(text, type) {{
@@ -547,23 +756,28 @@ def generar_html():
 # ==============================================================================
 
 def url_decode(val: str) -> str:
-    """Decodifica caracteres especiales URL (%20, %40, +, etc.) para SSIDs y contraseñas."""
+    """Decodifica caracteres especiales URL (%20, %C3%A1, +, etc.) en UTF-8."""
     if not val:
         return ""
     val = val.replace("+", " ")
     parts = val.split("%")
     if len(parts) == 1:
         return val
-    out = [parts[0]]
+    byte_arr = bytearray(parts[0].encode("utf-8"))
     for item in parts[1:]:
         if len(item) >= 2:
             try:
-                out.append(chr(int(item[:2], 16)) + item[2:])
+                byte_arr.append(int(item[:2], 16))
+                if len(item) > 2:
+                    byte_arr.extend(item[2:].encode("utf-8"))
             except ValueError:
-                out.append("%" + item)
+                byte_arr.extend(("%" + item).encode("utf-8"))
         else:
-            out.append("%" + item)
-    return "".join(out)
+            byte_arr.extend(("%" + item).encode("utf-8"))
+    try:
+        return byte_arr.decode("utf-8")
+    except Exception:
+        return "".join(chr(b) for b in byte_arr)
 
 def parse_query_params(path):
     """Extrae y decodifica parámetros GET de la query string."""
@@ -661,14 +875,26 @@ def iniciar_servidor():
                 conn.close()
                 continue
 
-            # 4. Endpoint Wi-Fi: Escanear redes cercanas (/wifi/scan)
+            # 4. Endpoint API: Personalizar nombre de un contacto (/rename?id=0&name=...)
+            if path.startswith('/rename?'):
+                params = parse_query_params(path)
+                relay_id = int(params.get('id', -1))
+                new_name = params.get('name', '').strip()
+                if rename_relay(relay_id, new_name):
+                    send_json(conn, {"ok": True, "id": relay_id, "name": relays[relay_id]["name"]})
+                else:
+                    send_json(conn, {"ok": False, "error": "Nombre o ID inválido."}, status="400 Bad Request")
+                conn.close()
+                continue
+
+            # 5. Endpoint Wi-Fi: Escanear redes cercanas (/wifi/scan)
             if path.startswith('/wifi/scan'):
                 networks = wifi.scan_networks()
                 send_json(conn, networks)
                 conn.close()
                 continue
 
-            # 5. Endpoint Wi-Fi: Guardar y conectar a nueva red (/wifi/save?ssid=...&pass=...&pin=...)
+            # 6. Endpoint Wi-Fi: Guardar y conectar a nueva red (/wifi/save?ssid=...&pass=...&pin=...)
             if path.startswith('/wifi/save?'):
                 params = parse_query_params(path)
                 ssid = params.get('ssid', '').strip()
@@ -679,7 +905,7 @@ def iniciar_servidor():
                 conn.close()
                 continue
 
-            # 6. Endpoint Wi-Fi: Olvidar red actual y volver a modo AP (/wifi/forget?pin=...)
+            # 7. Endpoint Wi-Fi: Olvidar red actual y volver a modo AP (/wifi/forget?pin=...)
             if path.startswith('/wifi/forget?'):
                 params = parse_query_params(path)
                 pin = params.get('pin', '').strip()
@@ -691,13 +917,13 @@ def iniciar_servidor():
                 conn.close()
                 continue
 
-            # 7. Endpoint Wi-Fi: Consultar estado actual (/wifi/status)
+            # 8. Endpoint Wi-Fi: Consultar estado actual (/wifi/status)
             if path.startswith('/wifi/status'):
                 send_json(conn, wifi.get_status())
                 conn.close()
                 continue
 
-            # 8. Ruta Principal (y detección de Portal Cautivo): Retornar interfaz HTML
+            # 9. Ruta Principal (y detección de Portal Cautivo): Retornar interfaz HTML
             html_content = generar_html()
             html_bytes = html_content.encode('utf-8')
             response_headers = (
